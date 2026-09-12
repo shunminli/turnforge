@@ -1,0 +1,83 @@
+# CLI 宿主架构
+
+状态：已实现（M0）；实现入口：[src/main.rs](../../../src/main.rs)。
+本篇说明组合与资源责任；参数和退出行为见 [设计文档](design.md)。
+返回 [文档导航](../../README.md)。
+
+## 职责与非职责
+
+CLI 是 headless 库的第一个真实消费者，每个 `run` 进程创建一个 Agent、运行一个用户 turn。
+它负责参数解析、权限配置、模型和工具组装、事件交付、Ctrl-C 与退出码。
+它不拥有 Agent 的会话状态机，不解析 SSE，不实现工具业务，也不直接改写 transcript。
+当前没有交互会话、TUI、配置文件、自动登录、持久化恢复或动态 provider 选择。
+编译入口明确限定 Unix，支持目标是 macOS/Linux；不是跨平台终端抽象。
+
+## 组件关系
+
+```text
+Cli / RunArgs / HostArgs
+  └─ execute
+      ├─ registry → Workspace + ToolRegistry
+      ├─ OpenAiModel + AgentConfig → Agent<OpenAiModel>
+      ├─ run future → Agent::run → Event sink → mpsc(64)
+      ├─ writer future ← output::forward ← Receiver<Event>
+      └─ select(execution = join!(run, writer), ctrl_c)
+```
+
+`tools` 子命令在 `registry` 后直接输出可用工具定义，不创建模型或 Agent。
+`run` 的 registry、prompt 输入和模型配置校验先完成，随后才建立取消与输出链路。
+
+| 资源 | owner / transfer | 结束责任 |
+|---|---|---|
+| 工作区根与能力授权 | `registry` 构造；工具持有各自 Workspace 克隆 | 工具随 Registry/Agent 释放 |
+| 模型、工具集合、历史 | 移入 `Agent`；宿主持有 Agent 并给 run 可变借用 | `execute` 等待 run 结束后释放 |
+| 取消 token | `execute` 创建；run、writer、signal 路径共享借用 | 请求取消不等于提前 drop run |
+| 事件 Sender | run future 的回调使用 | run 返回后显式 `drop(sender)` |
+| 事件 Receiver / stdout | Receiver 移入 writer；stdout 由 `output::forward` 创建 | writer 返回时释放 |
+| execution future | signal select 持有、pin | 正常或取消都等待 run 与 writer |
+
+run 与 writer 是 `tokio::join!` 并发轮询的 future，不是各自 `spawn` 的后台任务。
+宿主没有 detached signal task，也没有阻塞 stdout worker；工具内部 worker 的清理由工具负责。
+
+## 取消链路与完成边界
+
+Ctrl-C 分支先调用 `cancel.cancel()`，再 `execution.await`，保留工具清理和消息闭合机会。
+输出队列故障由事件 sink 发出取消；writer 自身失败也发出取消。
+Agent 负责处理已提交 tool call 的终态；CLI 不能以 `abort` 代替工具清理。
+这只约束正常协作取消，不保证宿主被 SIGKILL、panic 或运行 future 被外部丢弃时恢复。
+
+`execution` 与 `ctrl_c()` 的外层 select 未设 `biased`；两者同时就绪不承诺信号优先。
+信号到达时 Agent 可能已完成而 writer 仍在排空，取消 token 不会改写已返回的 RunOutcome。
+因此“收到 Ctrl-C”不能单独推导退出码；实际结果还受输出失败优先级影响。
+
+## 为什么宿主采用有界事件桥接
+
+Agent 的事件回调是同步 `FnMut`，不能在回调中 await 慢消费者。
+宿主用 `try_send` 保持回调短小；队列容量是 64 个事件，不是 64 KiB 或总内存限额。
+首次发送失败即记住错误并取消；之后不再尝试发送任何事件，允许 run 完成内存内清理。
+这是一种失败并取消策略，不是可靠事件总线、丢弃旧事件或无限等待的背压协议。
+
+队列隔离生产与输出，但无法保证终态抵达已堵塞/断开的消费者。
+输出形式、Unix fd 生命周期和每事件写入超时详见 [事件输出架构](../event-output/architecture.md)。
+
+## 权限组合边界
+
+`registry` 始终注册 5 个文件操作和 `bash`，由 Registry 在展示与执行两处过滤授权。
+默认模型可见的只有 `list_files`、`read_file`；不是只把读工具对象放进 Registry。
+`allow_write` 与 `allow_shell` 独立；shell 能以宿主权限读写工作区外资源。
+工作区路径限制属于文件工具，system prompt 中的工作区说明不能替代权限校验。
+相关约束见 [工具运行时架构](../tool-runtime/architecture.md)。
+
+## 后续扩展约束
+
+- 新宿主应复用 Agent/Model/Tool，不把 CLI 参数类型引入 library。
+- 多轮会话应明确保留 Agent 的 owner，而不是每轮重建后假称拥有上下文。
+- 新增 provider 应在组合层选择适配器；协议差异留在 [模型模块](../model/architecture.md)。
+- 交互审批需要独立的请求/应答生命周期；当前静态能力开关不能冒充审批队列。
+- 可持续输出或恢复必须先设计交付合同；当前 [协议](../protocol/architecture.md) 只是暂态通知。
+
+## 维护检查
+
+修改宿主生命周期时，同时检查 `execute` 中的 Sender 关闭、writer 返回、取消传播和 join。
+修改配置时同步 `--help`、README 和本模块设计表，不增加隐式凭据来源。
+行为证据与目前缺口见 [设计文档的验证部分](design.md#验证与缺口)。
