@@ -1,0 +1,15 @@
+{
+  "ollama_version": "0.33.3",
+  "runtime_asset": {
+    "url": "https://github.com/ollama/ollama/releases/download/v0.33.3/ollama-darwin.tgz",
+    "sha256": "342db03df80bb9db84ff64246031bd5f70c09b59ff52fa5cc9aaae3476cc4a9d"
+  },
+  "source_model": {
+    "name": "qwen3:4b-instruct-2507-q4_K_M",
+    "digest": "0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0"
+  },
+  "test_model": {
+    "name": "turnforge-test:qwen3-4b-v1",
+    "digest": "1cfb1620611f6fdcdbc90e3c32f0b0123b7ac36502c790eb90897941703ec363"
+  }
+}

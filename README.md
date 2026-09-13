@@ -45,6 +45,10 @@ cargo run --locked -- run '在 README.md 中补充测试说明' --workspace . --
 本地无鉴权模型可使用 `http://127.0.0.1:端口/v1`，并取消上述 key 环境变量。
 程序不会读取 Codex、Claude Code 的凭据，也没有自动登录流程。
 
+没有云端模型时，可按[本地 LLM 指南](docs/local-llm.md)安装固定版本 Ollama 与约 2.5 GB 的
+非思考小模型，使用 `turnforge-test:qwen3-4b-v1` 跑真实 API/工具闭环。服务只监听本机，前台启动，
+不设置开机启动；模型权重不进入仓库。
+
 授权执行 shell（拥有宿主机权限，请先读下面的安全边界）：
 
 ```sh
@@ -94,7 +98,8 @@ cargo test --locked --release --all-targets
 cargo build --locked --release
 ```
 
-测试无需 API key，也不调用付费模型。`Cargo.lock` 纳入版本管理。
+默认测试无需 API key，也不调用真实模型。另有默认忽略的[本地模型冒烟测试](docs/local-llm.md#5-运行测试和手工体验)，
+需要显式启用且不替代 CI 确定性门禁。`Cargo.lock` 纳入版本管理。
 CI 已配置 macOS/Linux 门禁；远端结果要在推送后确认。
 
 维护入口是[文档总索引](docs/README.md)。8 个核心模块分别有独立的架构与设计文档，

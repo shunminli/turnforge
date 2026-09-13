@@ -1,0 +1,8 @@
+# Non-thinking tool-capable model. The resolved digests live in local-llm.lock.json.
+FROM qwen3:4b-instruct-2507-q4_K_M
+
+# Small, serial smoke tests; these settings are not an accuracy benchmark.
+PARAMETER num_ctx 8192
+PARAMETER num_predict 1024
+PARAMETER temperature 0
+PARAMETER seed 42
