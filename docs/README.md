@@ -45,6 +45,8 @@
 
 - [系统架构](architecture.md)：模块关系与端到端控制流。
 - [文档维护规范](documentation-guide.md)：如何更新、检查和扩展文档体系。
+- [本地 LLM 指南](local-llm.md)：固定 Ollama/小模型基线、前台服务生命周期与显式启用的真实模型冒烟。
+- [本地 LLM 回归记录（2026-09-12）](verification/local-llm-2026-09-12.md)：已执行用例、输入指纹、环境与结果边界；属于历史证据。
 - [Helixent 迁移路线](helixent-migration.md)：参考基线、差异与未实现能力。
 - [代码来源说明](provenance.md)：来源和许可证检查边界。
 - [M0 实现计划](implementation-plan.md)、[M0 验证记录](verification.md)：阶段性历史证据，不作为永久基线或实时状态。
@@ -56,4 +58,5 @@
 - [Agent 测试](../tests/agent.rs)：会话顺序、取消、失败、步数与中断恢复限制。
 - [工具测试](../tests/tools.rs)：输入/权限/路径、文件副作用、进程与管道。
 - [CLI/HTTP 测试](../tests/cli_http.rs)：真实 TCP、binary、NDJSON、信号与输出消费。
+- [本地 LLM 冒烟](../tests/local_llm.rs)：真实本机模型的文本、读文件和写文件闭环；默认忽略，不替代确定性回归。
 - [CI](../.github/workflows/ci.yml)：目前执行 Rust 格式、Clippy、debug/release 测试和构建；不自动证明文档与代码语义一致。
