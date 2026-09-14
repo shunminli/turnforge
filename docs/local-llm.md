@@ -143,6 +143,7 @@ cargo test --locked --release --test local_llm -- --ignored --test-threads=1 --n
 | LLM-001 / `local_llm_plain_text_stream_completes` | 临时空目录；一句问候；只读 | 存在非空文本增量和最终回答；没有工具调用；正常结束 |
 | LLM-002 / `local_llm_reads_unknown_file_marker` | 测试预写 `marker.txt`；只读；prompt 不包含临时生成的 marker | 成功的 `read_file` 结果和最终回答都包含预写 marker；不是模型猜中固定答案 |
 | LLM-003 / `local_llm_writes_file_and_finishes` | 临时空目录；仅显式开启 `--allow-write` | 独立读取磁盘 `result.txt`，精确等于 `turnforge-local-write-ok`，无末尾换行；成功的 `write_file` 结果路径和字节数匹配；随后模型正常结束 |
+| LLM-004 / `local_llm_debug_steps_through_read_and_final_answer` | `debug` 子命令；只读临时 `marker.txt`；prompt 不含动态 marker | 自动读暂停事件再发带 ID 的 Step；检查工具前预览、read_file 结果及 AfterTool 快照包含 marker，最终答案匹配，释放 Finish 后成功退出 |
 
 共同断言包括：
 
@@ -151,6 +152,11 @@ cargo test --locked --release --test local_llm -- --ignored --test-threads=1 --n
 - 每个工具开始事件对应已提交的调用，每个结果关闭已开始的调用；新 Assistant 之前上一批调用已闭合。
   调用 ID 只要求同一 Assistant 消息内唯一，不固定模型生成的 ID 或工具顺序。
 - 最后提交的是没有待执行工具、文本非空的 Assistant，不把仅有流式增量当作完整回答。
+
+前三个用例走普通 `run`，LLM-004 走同一 Agent 的原生调试路径。调试驱动保持 stdin 开放，
+只有收到 `debug_paused` 后才提交当前 ID 的 Step；首个快照只含 User，pause ID 按实际暂停递增，version 为 1。
+它验证真实模型可以穿过模型—工具—结果—最终回答的单步闭环，不要求固定暂停总数或具体模型 call ID。
+手工控制、EOF 取消与机器驱动注意事项见[原生调试指南](debugging.md)。
 
 测试启动真实 Turnforge binary，固定 endpoint/model，清空子进程继承环境并绕过代理，
 只使用合成数据与临时工作区，永不传 `--allow-shell`。每次 CLI 最多 4 个模型步骤、
@@ -207,3 +213,4 @@ lock 记录的是模型清单的完整 digest，不是下载页面显示的短 I
 
 已完成运行的环境、输入指纹和结果见[本地 LLM 回归记录（2026-09-12）](verification/local-llm-2026-09-12.md)。
 该记录是历史证据，不代表此后每个提交都运行过真实模型，也不把默认 CI 的 ignored 计作通过。
+包含 LLM-004 的后续执行证据见[原生调试验收记录（2026-09-14）](verification/debugging-2026-09-14.md)。

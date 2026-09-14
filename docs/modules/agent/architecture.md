@@ -20,6 +20,7 @@
 | `messages: Vec<Message>` | Agent 独占可变 | 跨 user turn 的内存历史 |
 | `state: RunState` | Agent 独占可变 | 可读取的阶段与结束结果 |
 | token / event callback | run 调用期间借用 | 宿主请求取消、消费通知 |
+| 可选 `DebugSession` | `run_debug` 消费，run 期间持有 | 有界控制接收端、单步模式与暂停序号；不持有 Agent |
 
 [CLI](../cli/architecture.md) 是实际宿主；未来其它宿主也应调用相同库 API。
 `ModelRequest` 临时借用 system、messages 和可见工具定义，provider 不能获得会话的可变引用。
@@ -37,12 +38,23 @@ Tool 只接收自己的 JSON 参数和取消信号，不回指 Agent，也不直
 ```
 
 一个 run 包含多个 step，一个 step 是一次模型请求及它返回的工具批次。
+调试的 Step 命令则只释放一次模型/一次工具/最终结束动作，不能与这里的模型 step 计数混用。
 `&mut self` 在调用期间独占 Agent，防止正常 Rust 调用者并发启动两个 run。
 `messages()` / `state()` 只提供只读引用；没有清空、任意追加、外部 setter 或恢复导入入口。
 
 Agent 不 spawn 子任务。模型 future 可以取消丢弃；工具 future 要由执行实现完成清理后再返回。
 CLI 发 token 后继续等待 run；Agent 不以一个统一超时直接中断任意副作用工具。
 每个工具结果提交后让出调度，即使未知/拒绝工具立即完成，也给宿主机会处理输出与取消。
+
+## 调试运行
+
+`run_debug` 与 `run` 共享执行循环，前者在安全边界协作等待控制，后者保持自动运行。
+Agent 设置 `Paused` 并通过事件发送 owned 快照；仍持有同一 `&mut self`，不会把历史修改权交给 Controller。
+首次模型请求前、完整 Assistant 提交后、每条 Tool 结果提交后均可暂停；模型/工具执行中不强行暂停 future。
+工具结果后的边界意味着工具已返回且其清理 owner 完成正常清理路径，不是仅仅收到一个 stdout 标记。
+
+控制 channel、pause ID、防旧命令重放和快照字段属于[调试模块](../debugger/design.md)。
+Agent 仍负责所有调用结果配对；暂停处取消同样沿原工具补齐逻辑结束，不等待额外 Finish 命令。
 
 ## 关键取舍
 
@@ -58,9 +70,10 @@ CLI 发 token 后继续等待 run；Agent 不以一个统一超时直接中断�
 子进程清理属于[Shell](../shell-tool/design.md)，流完整性属于[模型适配器](../model/design.md)。
 最终事件发出与 stdout 交付不同，后者由[事件输出](../event-output/design.md)负责。
 
-意外 drop 或 callback panic 可使 run 停在 Running；后续调用明确拒绝恢复不确定状态。
+意外 drop 或 callback panic 可使 run 停在 Running 或 Paused；后续调用明确拒绝恢复不确定状态。
 这不是完整的 crash recovery：已发生的外部副作用仍存在，历史也没有持久化。
 会话长期增长没有 token/内存总预算；max_steps 只限制本次 run 的模型请求次数。
+调试快照额外复制历史；这是观察成本，不是持久化或固定内存预算。
 
 ## 维护影响
 
