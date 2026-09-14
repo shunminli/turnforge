@@ -12,7 +12,7 @@ use std::{
 
 use serde_json::Value;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     time::timeout,
 };
@@ -31,6 +31,7 @@ struct ObservedRun {
     final_text: String,
     calls: Vec<CompletedCall>,
     diagnostic: String,
+    snapshots: Vec<Value>,
 }
 
 async fn check_local_baseline() {
@@ -113,12 +114,71 @@ fn diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
     )
 }
 
-async fn run(root: &Path, prompt: &str, allow_write: bool) -> ObservedRun {
+// Act only after receiving a real pause event. Keeping stdin alive through the
+// final response also catches hosts that hang waiting for another command.
+async fn step_debug_stream(
+    reader: &mut (impl AsyncRead + Unpin),
+    input: &mut tokio::process::ChildStdin,
+    bytes: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let mut buffer = [0; 8192];
+    let mut line_start = 0;
+    let mut pause_id = 0_u64;
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(false);
+        }
+        if bytes.len() + count > CAPTURE_LIMIT {
+            // A failed capture must stop asking the child for more work. EOF
+            // takes its normal cancellation path while remaining output drains.
+            input.shutdown().await?;
+            drain(reader, bytes).await?;
+            return Ok(true);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        while let Some(offset) = bytes[line_start..].iter().position(|byte| *byte == b'\n') {
+            let line_end = line_start + offset;
+            let event: Value = match serde_json::from_slice(&bytes[line_start..line_end]) {
+                Ok(event) => event,
+                Err(error) => {
+                    input.shutdown().await?;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                }
+            };
+            line_start = line_end + 1;
+            if event["type"] == "debug_paused" {
+                pause_id += 1;
+                assert_eq!(
+                    event["snapshot"]["pause_id"], pause_id,
+                    "pause IDs must increase once per stop"
+                );
+                assert_eq!(event["snapshot"]["version"], 1);
+                if pause_id == 1 {
+                    assert_eq!(event["snapshot"]["point"]["kind"], "before_model");
+                    assert_eq!(event["snapshot"]["messages"].as_array().unwrap().len(), 1);
+                }
+                input
+                    .write_all(format!("step {pause_id}\n").as_bytes())
+                    .await?;
+            }
+        }
+    }
+}
+
+async fn run(root: &Path, prompt: &str, allow_write: bool, debug: bool) -> ObservedRun {
     let started_at = Instant::now();
     check_local_baseline().await;
     let mut command = Command::new(env!("CARGO_BIN_EXE_turnforge"));
     command
-        .args(["run", prompt, "--model", MODEL, "--base-url", BASE_URL])
+        .args([
+            if debug { "debug" } else { "run" },
+            prompt,
+            "--model",
+            MODEL,
+            "--base-url",
+            BASE_URL,
+        ])
         .arg("--workspace")
         .arg(root)
         .args(["--json", "--max-steps", "4", "--request-timeout", "90"])
@@ -128,7 +188,7 @@ async fn run(root: &Path, prompt: &str, allow_write: bool) -> ObservedRun {
         .env_clear()
         .env("NO_PROXY", "*")
         .env("no_proxy", "*")
-        .stdin(Stdio::null())
+        .stdin(if debug { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -142,6 +202,7 @@ async fn run(root: &Path, prompt: &str, allow_write: bool) -> ObservedRun {
         .expect("cannot start the real Turnforge CLI");
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
+    let mut stdin_pipe = child.stdin.take();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     // The test owns the child and both pipes. These are concurrently polled
@@ -149,7 +210,12 @@ async fn run(root: &Path, prompt: &str, allow_write: bool) -> ObservedRun {
     let result = timeout(RUN_TIMEOUT, async {
         tokio::join!(
             child.wait(),
-            drain(&mut stdout_pipe, &mut stdout),
+            async {
+                match stdin_pipe.as_mut() {
+                    Some(input) => step_debug_stream(&mut stdout_pipe, input, &mut stdout).await,
+                    None => drain(&mut stdout_pipe, &mut stdout).await,
+                }
+            },
             drain(&mut stderr_pipe, &mut stderr)
         )
     })
@@ -296,6 +362,11 @@ async fn run(root: &Path, prompt: &str, allow_write: bool) -> ObservedRun {
         final_text,
         calls,
         diagnostic,
+        snapshots: events
+            .iter()
+            .filter(|e| e["type"] == "debug_paused")
+            .map(|e| e["snapshot"].clone())
+            .collect(),
     }
 }
 
@@ -306,6 +377,7 @@ async fn local_llm_plain_text_stream_completes() {
     let result = run(
         workspace.path(),
         "Reply with one short greeting sentence. Do not use any tools.",
+        false,
         false,
     )
     .await;
@@ -332,6 +404,7 @@ async fn local_llm_reads_unknown_file_marker() {
     let result = run(
         workspace.path(),
         "Use read_file to read marker.txt in the workspace. In your final answer, report the exact value assigned to code in that file. Read the actual file; do not guess. Do not modify any files.",
+        false,
         false,
     )
     .await;
@@ -362,6 +435,7 @@ async fn local_llm_writes_file_and_finishes() {
         workspace.path(),
         "Use write_file to create result.txt in the workspace with exactly this content: turnforge-local-write-ok (no final newline). After the tool succeeds, give a brief confirmation. Do not create any other files.",
         true,
+        false,
     )
     .await;
     assert_eq!(
@@ -383,5 +457,186 @@ async fn local_llm_writes_file_and_finishes() {
         }),
         "missing successful write result for the independently checked file\n{}",
         result.diagnostic
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned local Ollama runtime and turnforge-test:qwen3-4b-v1 model"]
+async fn local_llm_debug_steps_through_read_and_final_answer() {
+    let workspace = tempfile::tempdir().unwrap();
+    let marker = format!(
+        "debug-marker-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    std::fs::write(
+        workspace.path().join("marker.txt"),
+        format!("code = {marker}\n"),
+    )
+    .unwrap();
+    let result = run(
+        workspace.path(),
+        "Use read_file to read marker.txt in the workspace. In your final answer, report the exact value assigned to code in that file. Read the actual file; do not guess. Do not modify any files.",
+        false,
+        true,
+    ).await;
+    let read = result
+        .calls
+        .iter()
+        .find(|completed| {
+            completed.call["name"] == "read_file" && completed.output["status"] == "ok"
+        })
+        .unwrap_or_else(|| panic!("no real read occurred\n{}", result.diagnostic));
+    assert!(
+        read.output["data"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&marker),
+        "{}",
+        result.diagnostic
+    );
+    assert!(result.final_text.contains(&marker), "{}", result.diagnostic);
+    assert!(
+        result
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot["point"]["kind"] == "after_model"
+                && snapshot["next"]["kind"] == "tool"),
+        "missing tool preview\n{}",
+        result.diagnostic
+    );
+    let after_read = result
+        .snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot["point"]["kind"] == "after_tool"
+                && snapshot["point"]["call_id"] == read.call["id"]
+                && snapshot["messages"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|message| {
+                        message["output"]["data"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&marker))
+                    })
+        })
+        .unwrap_or_else(|| panic!("missing read-result pause\n{}", result.diagnostic));
+    assert!(
+        after_read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["output"]["data"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&marker))),
+        "{}",
+        result.diagnostic
+    );
+    assert_eq!(
+        result.snapshots.last().unwrap()["next"]["kind"],
+        "finish",
+        "{}",
+        result.diagnostic
+    );
+    assert_eq!(
+        result.snapshots.last().unwrap()["next"]["outcome"],
+        "completed",
+        "{}",
+        result.diagnostic
+    );
+    eprintln!(
+        "local debug evidence: {} semantic pauses, read tool result and final answer verified",
+        result.snapshots.len()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned local Ollama runtime and turnforge-test:qwen3-4b-v1 model"]
+async fn local_llm_lab_auto_reads_fixture_without_stdin() {
+    check_local_baseline().await;
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_turnforge"))
+        .args(["lab", "--case", "read", "--auto"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let result = timeout(RUN_TIMEOUT, async {
+        tokio::join!(
+            child.wait(),
+            drain(&mut stdout_pipe, &mut stdout),
+            drain(&mut stderr_pipe, &mut stderr)
+        )
+    })
+    .await;
+    let (status, out, err) = match result {
+        Ok(result) => result,
+        Err(_) => {
+            let kill = child.start_kill();
+            let reap = timeout(Duration::from_secs(5), child.wait()).await;
+            panic!(
+                "lab exceeded {RUN_TIMEOUT:?}: kill={kill:?}, reap={reap:?}\n{}",
+                diagnostic(&stdout, &stderr)
+            );
+        }
+    };
+    let diagnostic = diagnostic(&stdout, &stderr);
+    assert!(
+        matches!(out, Ok(false)) && matches!(err, Ok(false)),
+        "capture failed: {out:?}, {err:?}\n{diagnostic}"
+    );
+    assert!(status.unwrap().success(), "{diagnostic}");
+    let text = String::from_utf8(stdout).unwrap();
+    assert!(
+        text.contains("[PASS]") && !text.contains("[FAIL]"),
+        "{diagnostic}"
+    );
+    assert!(
+        text.matches("[lab paused #").count() >= 4,
+        "missing model/tool/final boundaries\n{diagnostic}"
+    );
+    assert!(
+        text.contains("read_file"),
+        "missing the real read tool\n{diagnostic}"
+    );
+    let read_result: Value = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("[result] "))
+        .filter_map(|line| line.split_once(": ").map(|(_, result)| result))
+        .filter_map(|result| serde_json::from_str::<Value>(result).ok())
+        .find(|result| result["status"] == "ok" && result["data"]["text"].is_string())
+        .unwrap_or_else(|| panic!("missing real read result\n{diagnostic}"));
+    let marker = read_result["data"]["text"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .strip_prefix("code = ")
+        .expect("read fixture must contain its independently generated marker");
+    assert!(
+        text.rsplit("[model step ").next().unwrap().contains(marker),
+        "final model output did not consume the unknown file marker\n{diagnostic}"
+    );
+    let root = text
+        .lines()
+        .find_map(|line| line.strip_prefix("临时工作区："))
+        .expect("lab banner must identify its isolated workspace");
+    assert!(
+        !Path::new(root).exists(),
+        "lab did not clean its fixture\n{diagnostic}"
+    );
+    eprintln!(
+        "local lab evidence: read case completed and verified, stdin=/dev/null, fixture removed, elapsed={:.2}s",
+        started.elapsed().as_secs_f64()
     );
 }

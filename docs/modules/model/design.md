@@ -32,8 +32,16 @@ pub trait Model: Send + Sync {
 - 禁用 HTTP 重定向；provider 不实现 `Debug`。非 2xx 响应只暴露状态码，不输出 body；reqwest 错误移除 URL。
 - 环境变量读取归 CLI：优先非空 `TURNFORGE_API_KEY`，再取非空 `OPENAI_API_KEY`；库不自行读取环境。
 
+本地专用 `OpenAiModel::new_local(base_url, model, timeout)` 同样返回 `Result<Self, ModelError>`：
+
+- 无 api_key 参数，构造不设置授权头；不读取云凭据。
+- 原始 URL authority 必须能解析为 loopback `IpAddr/SocketAddr`；拒绝 DNS 名（含 localhost）、
+  简写/整数 IPv4 和 IPv4-mapped IPv6。可使用 HTTP 或 HTTPS 的字面 loopback，与 Lab 只接受 HTTP origin 的上层限制不同。
+- 显式 `ClientBuilder::no_proxy()`；不依赖宿主临时更改环境，也不会跟随重定向。
+- 其余 URL/模型/超时、请求序列化、SSE、错误及取消路径与 `new` 共用；没有另一套 provider 实现。
+
 以上是传输防护，不是网络沙箱或秘密存储方案。选择 endpoint 仍意味着向该服务发送 prompt/工具数据；
-Client 未显式禁用环境代理，也不提供密钥内存清零。CLI 的 NDJSON 可能包含会话内容。
+通用 `new` 保留 reqwest 环境代理行为，只有 `new_local` 显式禁用。没有密钥内存清零；CLI 的 NDJSON 可能包含会话内容。
 
 ## 3. 请求序列化
 
@@ -106,6 +114,12 @@ Agent 把 `Cancelled` 转为取消 outcome，其余错误转为失败；模型�
 [agent.rs 测试](../../../tests/agent.rs)中的 `invalid_calls_never_commit_or_execute`、
 `provider_error_leaves_no_partial_assistant` 和 `host_cancellation_stops_a_pending_model`
 分别补充通用调用校验、失败提交边界和不配合取消的 provider future 被丢弃的合同。
+
+[lab_cli.rs](../../../tests/lab_cli.rs) 的 `lab_auto_chat_ignores_stdin_and_inherited_cloud_configuration`
+通过真实 CLI/local provider 检查固定本地配置和无 Authorization 的模型请求；Lab 上层 origin 边界另由
+`lab.rs::tests::lab_origin_requires_literal_loopback_and_no_extra_url_components` 检查。
+目前没有直接覆盖 `OpenAiModel::new_local` 全部非法输入的独立矩阵；Lab 入口拒绝不等于证明所有库调用者。
+以上测试也不证明任意代理环境或所有网络故障组合。
 
 ## 7. 已知缺口与维护清单
 

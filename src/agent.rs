@@ -4,9 +4,10 @@ use thiserror::Error;
 
 use crate::{
     CancellationToken, Event, Model, Phase, RunOutcome, RunState,
+    debug::{DebugAction, DebugPoint, DebugSession, DebugSnapshot},
     message::{AssistantMessage, Message, ToolOutput},
     model::{ModelError, ModelRequest},
-    tools::ToolRegistry,
+    tools::{ToolDefinition, ToolRegistry},
 };
 
 pub struct AgentConfig {
@@ -71,10 +72,36 @@ impl<M: Model> Agent<M> {
         cancel: &CancellationToken,
         emit: &mut (dyn FnMut(Event) + Send),
     ) -> Result<RunOutcome, AgentError> {
-        if matches!(self.state, RunState::Running { .. }) {
+        self.run_with_control(input.into(), cancel, None, emit)
+            .await
+    }
+
+    /// Run the same loop with semantic checkpoints. Keep the controller alive
+    /// and await this future through cancellation; snapshots cannot resume a drop.
+    pub async fn run_debug(
+        &mut self,
+        input: impl Into<String>,
+        session: DebugSession,
+        emit: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<RunOutcome, AgentError> {
+        let cancel = session.cancellation().clone();
+        self.run_with_control(input.into(), &cancel, Some(session), emit)
+            .await
+    }
+
+    async fn run_with_control(
+        &mut self,
+        input: String,
+        cancel: &CancellationToken,
+        mut debug: Option<DebugSession>,
+        emit: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<RunOutcome, AgentError> {
+        if matches!(
+            self.state,
+            RunState::Running { .. } | RunState::Paused { .. }
+        ) {
             return Err(AgentError::Interrupted);
         }
-        let input = input.into();
         if input.trim().is_empty() {
             return Err(AgentError::EmptyInput);
         }
@@ -84,7 +111,7 @@ impl<M: Model> Agent<M> {
         };
         emit(Event::RunStarted);
         self.commit(Message::User { text: input }, emit);
-        let result = self.run_loop(cancel, emit).await;
+        let result = self.run_loop(cancel, &mut debug, emit).await;
         let outcome = match &result {
             Ok(outcome) => outcome.clone(),
             Err(_) => RunOutcome::Failed,
@@ -99,9 +126,20 @@ impl<M: Model> Agent<M> {
     async fn run_loop(
         &mut self,
         cancel: &CancellationToken,
+        debug: &mut Option<DebugSession>,
         emit: &mut (dyn FnMut(Event) + Send),
     ) -> Result<RunOutcome, AgentError> {
         let definitions = self.tools.definitions();
+        self.checkpoint(
+            debug,
+            1,
+            DebugPoint::BeforeModel,
+            DebugAction::Model { step: 1 },
+            &[],
+            &definitions,
+            emit,
+        )
+        .await;
         for step in 1..=self.config.max_steps.get() {
             if cancel.is_cancelled() {
                 return Ok(RunOutcome::Cancelled);
@@ -130,6 +168,25 @@ impl<M: Model> Agent<M> {
             validate_assistant(&assistant)?;
             let calls = assistant.tool_calls.clone();
             self.commit(Message::Assistant { message: assistant }, emit);
+            let next = calls.first().map_or_else(
+                || DebugAction::Finish {
+                    outcome: RunOutcome::Completed,
+                },
+                |call| DebugAction::Tool {
+                    index: 0,
+                    call: call.clone(),
+                },
+            );
+            self.checkpoint(
+                debug,
+                step,
+                DebugPoint::AfterModel,
+                next,
+                &calls,
+                &definitions,
+                emit,
+            )
+            .await;
             if calls.is_empty() {
                 return Ok(if cancel.is_cancelled() {
                     RunOutcome::Cancelled
@@ -137,22 +194,24 @@ impl<M: Model> Agent<M> {
                     RunOutcome::Completed
                 });
             }
-            self.state = RunState::Running {
-                step,
-                phase: Phase::Tools,
-            };
-            for call in calls {
+            for (index, call) in calls.iter().enumerate() {
+                // A checkpoint is only between operations, never around an
+                // in-flight side-effecting tool future.
+                self.state = RunState::Running {
+                    step,
+                    phase: Phase::Tools,
+                };
                 let output = if cancel.is_cancelled() {
                     ToolOutput::error("cancelled", "Not executed: run cancelled")
                 } else {
                     emit(Event::ToolStarted { call: call.clone() });
                     // Never select/drop a side-effecting tool future. Its owner
                     // observes cancellation, cleans up, then returns the facts.
-                    self.tools.execute(&call, cancel).await
+                    self.tools.execute(call, cancel).await
                 };
                 self.commit(
                     Message::Tool {
-                        call_id: call.id,
+                        call_id: call.id.clone(),
                         output,
                     },
                     emit,
@@ -160,12 +219,83 @@ impl<M: Model> Agent<M> {
                 // Unknown/denied tools can complete without ever suspending.
                 // Give the host an opportunity to drain events between calls.
                 tokio::task::yield_now().await;
+                if !cancel.is_cancelled() {
+                    let pending = &calls[index + 1..];
+                    let next = if let Some(call) = pending.first() {
+                        DebugAction::Tool {
+                            index: (index + 1) as u32,
+                            call: call.clone(),
+                        }
+                    } else if step == self.config.max_steps.get() {
+                        DebugAction::Finish {
+                            outcome: RunOutcome::StepLimit,
+                        }
+                    } else {
+                        DebugAction::Model { step: step + 1 }
+                    };
+                    self.checkpoint(
+                        debug,
+                        step,
+                        DebugPoint::AfterTool {
+                            index: index as u32,
+                            call_id: call.id.clone(),
+                        },
+                        next,
+                        pending,
+                        &definitions,
+                        emit,
+                    )
+                    .await;
+                }
             }
             if cancel.is_cancelled() {
                 return Ok(RunOutcome::Cancelled);
             }
         }
         Ok(RunOutcome::StepLimit)
+    }
+
+    // This helper borrows each field separately: DebugSession never owns the
+    // Agent or a mutable transcript reference. Only this loop commits messages.
+    #[allow(clippy::too_many_arguments)]
+    async fn checkpoint(
+        &mut self,
+        debug: &mut Option<DebugSession>,
+        step: u32,
+        point: DebugPoint,
+        next: DebugAction,
+        pending_calls: &[crate::message::ToolCall],
+        tools: &[ToolDefinition],
+        emit: &mut (dyn FnMut(Event) + Send),
+    ) {
+        let Some(debug) = debug else {
+            return;
+        };
+        let previous = self.state.clone();
+        let system = &self.config.system;
+        let max_steps = self.config.max_steps.get();
+        let messages = &self.messages;
+        debug
+            .checkpoint(
+                &mut self.state,
+                |pause_id| DebugSnapshot {
+                    version: 1,
+                    pause_id,
+                    step,
+                    point,
+                    next,
+                    system: system.clone(),
+                    messages: messages.clone(),
+                    tools: tools.to_vec(),
+                    pending_calls: pending_calls.to_vec(),
+                    max_steps,
+                },
+                emit,
+            )
+            .await;
+        // A dropped future intentionally leaves Paused/Running for Interrupted.
+        // Normal return (including cancel) restores the owning loop's phase.
+        self.state = previous;
     }
 
     fn commit(&mut self, message: Message, emit: &mut (dyn FnMut(Event) + Send)) {

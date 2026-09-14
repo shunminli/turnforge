@@ -1,11 +1,15 @@
 //! Text/function subset of the Chat Completions SSE protocol, not Responses API.
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{
-    Client, Url,
+    Client, ClientBuilder, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
@@ -34,6 +38,43 @@ impl OpenAiModel {
         api_key: Option<&str>,
         model: &str,
         timeout: Duration,
+    ) -> Result<Self, ModelError> {
+        Self::build(base_url, api_key, model, timeout, Client::builder())
+    }
+
+    /// Local-only transport: literal loopback IP, no credentials or proxy use.
+    /// The API prefix and SSE contract are the same as `new`.
+    pub fn new_local(base_url: &str, model: &str, timeout: Duration) -> Result<Self, ModelError> {
+        // Check the original authority so URL normalization cannot turn a DNS
+        // name, integer IPv4 address or shorthand into an accepted literal IP.
+        let authority = base_url
+            .split_once("://")
+            .and_then(|(_, remainder)| remainder.split(['/', '?', '#']).next())
+            .unwrap_or("");
+        let local = authority
+            .parse::<SocketAddr>()
+            .map(|address| address.ip())
+            .or_else(|_| authority.parse::<IpAddr>())
+            .or_else(|_| {
+                authority
+                    .strip_prefix('[')
+                    .and_then(|address| address.strip_suffix(']'))
+                    .unwrap_or("")
+                    .parse::<IpAddr>()
+            })
+            .is_ok_and(|address| address.is_loopback());
+        if !local {
+            return Err(config("local models require a literal loopback IP URL"));
+        }
+        Self::build(base_url, None, model, timeout, Client::builder().no_proxy())
+    }
+
+    fn build(
+        base_url: &str,
+        api_key: Option<&str>,
+        model: &str,
+        timeout: Duration,
+        builder: ClientBuilder,
     ) -> Result<Self, ModelError> {
         let mut endpoint = Url::parse(base_url).map_err(|_| config("invalid base URL"))?;
         let host = endpoint.host_str().unwrap_or("").trim_matches(['[', ']']);
@@ -65,7 +106,7 @@ impl OpenAiModel {
             auth.set_sensitive(true);
             headers.insert(AUTHORIZATION, auth);
         }
-        let client = Client::builder()
+        let client = builder
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))

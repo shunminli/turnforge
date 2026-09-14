@@ -10,6 +10,7 @@
 - `Message` 表达用户、完整助手回复和工具结果。
 - `ToolCall` / `ToolOutput` 关联请求与执行事实，`Usage` 保存可选的提供方计数。
 - `Event` 表达运行中可观察的通知，`RunState` / `Phase` / `RunOutcome` 区分阶段与结束原因。
+- 调试事件携带暂停快照、恢复通知和命令拒绝；命令与快照类型的 owner 是[debugger](../debugger/architecture.md)。
 
 这里不运行模型或工具、不修改会话、不负责输出队列、持久化、时钟或 ID 生成。
 纯数据结构没有后台任务、文件句柄或主动取消行为。类型能区分变体，不能单独证明消息序列合法。
@@ -22,6 +23,7 @@
 | `ModelDelta` | Model 实现 | Agent 包装为 Event，宿主显示 | 暂态增量，可能最终失败 |
 | `MessageCommitted` | Agent 先写历史，再发送克隆值 | 宿主观察或输出 | 已进入内存 transcript，不表示落盘 |
 | `RunFinished` | Agent 完成协作运行后产生 | 宿主决定显示/退出 | 运行结束通知，不是任务正确性的证明 |
+| `DebugPaused` / `DebugSnapshot` | Agent 安全边界复制逻辑上下文 | 调试宿主显示与检查 | 只读观察，不是恢复 checkpoint 或第二份可变会话 |
 
 `Event` 包装的 `ModelDelta` 定义位于 [model.rs](../../../src/model.rs)，由[模型模块](../model/architecture.md)
 负责其生成语义。逻辑上都属于跨边界数据，但不为文档分类移动 Rust 类型。
@@ -51,6 +53,9 @@
 - system prompt 保存在 `AgentConfig`，不放入 `Message`；不要假设导出历史已包括完整运行配置。
 - 数据可 serde 序列化，但没有协议版本、事件 sequence、run ID 或 durable commit 保证。
   可序列化不等于可直接用作稳定存储格式。
+
+调试快照单独带 `version: 1` 和本会话 `pause_id`；这不为整个 Event 流补上远程 RPC 版本、
+全局 run ID、事件排序或恢复保证。带 ID 的 Step/Continue/Inspect 是控制请求，不是新的 Message 角色。
 
 ## 维护边界
 

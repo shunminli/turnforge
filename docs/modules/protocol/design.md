@@ -47,11 +47,18 @@ OpenAI adapter 把 `arguments` 和整个 `ToolOutput` 分别编码成外部 API 
 | `message_committed` | `message` | 消息已持久化或 stdout 已交付 |
 | `tool_started` | 完整 `call` | 已通过 registry 权限或真的产生副作用 |
 | `run_finished` | `outcome` | 用户任务已经被正确完成 |
+| `debug_paused` | `snapshot` | 已持久化、自动获得工具授权或可在另一进程恢复 |
+| `debug_snapshot` | `snapshot` | 已执行下一动作或新增暂停点；它是 Inspect 的只读响应 |
+| `debug_resumed` | `pause_id` | 下一模型/工具必然成功 |
+| `debug_command_rejected` | `command`、`reason` | 命令已推进运行；该通知恰好表示拒绝 |
 
 `ModelDelta` 的 `kind` 为 `text { text }` 或 `tool_arguments { index, fragment }`。
 index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，也没有独立的全局 call ID。
 终态枚举序列化为 `completed`、`cancelled`、`step_limit`、`failed`。
 `RunState` 用 `status` 标签；运行中附带 `step` 和 `phase`（`model` / `tools`）。
+调试暂停为 `Paused { step, pause_id, point }`，序列化 status 为 `paused`。
+普通 `run` 不发上述 `debug_*` 事件；既有消费者若穷尽匹配 Rust enum，需要显式处理新增变体。
+快照 v1、DebugPoint/DebugAction 和严格命令序列化详见[调试设计](../debugger/design.md)。
 
 ## 配对、提交和取消不变量
 
@@ -69,6 +76,7 @@ index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，�
 ## 兼容性与限制
 
 - 无 session/run/step ID 全局命名、事件序号、时间戳或 JSON 版本字段；宿主不得跨运行盲目合流后依赖顺序恢复。
+- 调试 snapshot 有独立 version，pause ID 只在一次 DebugSession 内有意义；不是完整 Event 的全局版本或 ID。
 - Message 不保存 system prompt、工具定义、权限、模型配置，因此仅它本身不足以精确重放运行。
 - Usage 可缺省；缺省不等于零，不能把 token 字段当预算执行器。
 - 工具错误 code 为 String，不是封闭 enum；消费者应保留未知 code 的处理路径。

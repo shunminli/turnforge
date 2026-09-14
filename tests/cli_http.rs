@@ -494,3 +494,307 @@ fn stdout_can_be_redirected_to_a_regular_file_or_dev_null() {
     let text = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
     assert!(text.contains("run_finished"));
 }
+
+// The test owns the real process and its input/output streams. Every successful
+// path waits for process exit; kill_on_drop only backs up failed assertions.
+struct DebugProcess {
+    child: tokio::process::Child,
+    input: Option<tokio::process::ChildStdin>,
+    output: tokio::io::BufReader<tokio::process::ChildStdout>,
+    observed: Vec<Value>,
+}
+
+impl DebugProcess {
+    fn start(root: &Path, url: &str, extra: &[&str]) -> Self {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_turnforge"))
+            .args([
+                "debug",
+                "fixture task",
+                "--model",
+                "fixture-model",
+                "--base-url",
+                url,
+                "--workspace",
+            ])
+            .arg(root)
+            .args(["--json", "--request-timeout", "3", "--tool-timeout", "3"])
+            .args(extra)
+            .env_clear()
+            .env("NO_PROXY", "*")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        Self {
+            input: child.stdin.take(),
+            output: tokio::io::BufReader::new(child.stdout.take().unwrap()),
+            child,
+            observed: Vec::new(),
+        }
+    }
+
+    async fn event(&mut self, kind: &str) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    self.output.read_line(&mut line).await.unwrap(),
+                    0,
+                    "stdout closed before {kind}; observed={:?}",
+                    self.observed
+                );
+                let event: Value =
+                    serde_json::from_str(&line).expect("debug stdout must remain NDJSON");
+                self.observed.push(event.clone());
+                if event["type"] == kind {
+                    return event;
+                }
+                assert_ne!(
+                    event["type"], "run_finished",
+                    "unexpected terminal while awaiting {kind}"
+                );
+            }
+        })
+        .await;
+        match result {
+            Ok(event) => event,
+            Err(_) => {
+                let _ = self.child.kill().await;
+                panic!(
+                    "debug CLI did not emit {kind}; observed={:?}",
+                    self.observed
+                );
+            }
+        }
+    }
+
+    async fn send(&mut self, line: &str) {
+        use tokio::io::AsyncWriteExt;
+        self.input
+            .as_mut()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn finish(mut self, code: i32, outcome: &str) -> (Vec<Value>, String) {
+        use tokio::io::AsyncReadExt;
+        let mut stderr_pipe = self.child.stderr.take().unwrap();
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                self.child.wait(),
+                self.output.read_to_string(&mut stdout),
+                stderr_pipe.read_to_string(&mut stderr)
+            )
+        })
+        .await;
+        let (status, out, err) = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.child.kill().await;
+                panic!(
+                    "debug CLI did not finish with stdin still open; stderr={stderr}; observed={:?}",
+                    self.observed
+                );
+            }
+        };
+        out.unwrap();
+        err.unwrap();
+        assert_eq!(status.unwrap().code(), Some(code), "stderr={stderr}");
+        for line in stdout.lines() {
+            self.observed
+                .push(serde_json::from_str(line).expect("stdout must remain NDJSON"));
+        }
+        assert_eq!(
+            self.observed
+                .iter()
+                .filter(|e| e["type"] == "run_finished")
+                .count(),
+            1
+        );
+        assert_eq!(self.observed.last().unwrap()["outcome"], outcome);
+        (self.observed, stderr)
+    }
+}
+
+#[tokio::test]
+async fn debug_cli_steps_real_tool_effects_and_finishes_with_stdin_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(vec![
+        tool(
+            "write_file",
+            json!({"path":"debug.txt","content":"stepped"}),
+        ),
+        final_text("finished"),
+    ]);
+    let mut process = DebugProcess::start(dir.path(), &server.base_url, &["--allow-write"]);
+    let first = process.event("debug_paused").await;
+    assert_eq!(first["snapshot"]["pause_id"], 1);
+    assert_eq!(first["snapshot"]["point"]["kind"], "before_model");
+    assert!(!dir.path().join("debug.txt").exists());
+    process.send("inspect 1\n").await;
+    let inspected = process.event("debug_snapshot").await;
+    assert_eq!(first["snapshot"], inspected["snapshot"]);
+    process
+        .send("{\"command\":\"step\",\"pause_id\":1}\n")
+        .await;
+    let preview = process.event("debug_paused").await;
+    assert_eq!(preview["snapshot"]["pause_id"], 2);
+    assert_eq!(preview["snapshot"]["next"]["kind"], "tool");
+    assert!(
+        !dir.path().join("debug.txt").exists(),
+        "preview executed the tool"
+    );
+    process.send("step 1\n").await;
+    process.event("debug_command_rejected").await;
+    assert!(
+        !dir.path().join("debug.txt").exists(),
+        "stale ID released the tool"
+    );
+    process.send("step 2\n").await;
+    let after = process.event("debug_paused").await;
+    assert_eq!(after["snapshot"]["pause_id"], 3);
+    assert_eq!(after["snapshot"]["point"]["kind"], "after_tool");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("debug.txt")).unwrap(),
+        "stepped"
+    );
+    process.send("step 3\n").await;
+    let final_preview = process.event("debug_paused").await;
+    assert_eq!(final_preview["snapshot"]["pause_id"], 4);
+    assert_eq!(final_preview["snapshot"]["next"]["kind"], "finish");
+    process.send("continue 4\n").await;
+    let (events, stderr) = process.finish(0, "completed").await;
+    assert!(stderr.is_empty(), "unexpected diagnostics: {stderr}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "tool_started")
+            .count(),
+        1
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["messages"][3]["role"], "tool");
+}
+
+#[tokio::test]
+async fn debug_cli_eof_and_invalid_input_cancel_pending_tools() {
+    for invalid in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start(vec![tool(
+            "write_file",
+            json!({"path":"blocked","content":"bad"}),
+        )]);
+        let mut process = DebugProcess::start(dir.path(), &server.base_url, &["--allow-write"]);
+        process.event("debug_paused").await;
+        process.send("step 1\n").await;
+        assert_eq!(
+            process.event("debug_paused").await["snapshot"]["pause_id"],
+            2
+        );
+        if invalid {
+            process.send("step not-a-number\n").await;
+        } else {
+            drop(process.input.take());
+        }
+        let (events, stderr) = process
+            .finish(if invalid { 1 } else { 130 }, "cancelled")
+            .await;
+        assert!(!dir.path().join("blocked").exists());
+        assert!(
+            events
+                .iter()
+                .any(|e| e["message"]["output"]["code"] == "cancelled")
+        );
+        assert!(!events.iter().any(|e| e["type"] == "tool_started"));
+        if invalid {
+            assert!(
+                !stderr.is_empty(),
+                "invalid command must have stderr diagnostics"
+            );
+        }
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn debug_cli_sigint_during_shell_awaits_cleanup_and_closes_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(vec![tool(
+        "bash",
+        json!({"description":"debug cleanup", "command":"printf ready > ready; (sleep 1; printf escaped > escaped) & wait"}),
+    )]);
+    let mut process = DebugProcess::start(dir.path(), &server.base_url, &["--allow-shell"]);
+    process.event("debug_paused").await;
+    process.send("step 1\n").await;
+    assert_eq!(
+        process.event("debug_paused").await["snapshot"]["pause_id"],
+        2
+    );
+    assert!(!dir.path().join("ready").exists());
+    process.send("step 2\n").await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !dir.path().join("ready").exists() {
+        if Instant::now() > deadline {
+            let _ = process.child.kill().await;
+            panic!("debug shell never became ready");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(process.child.id().unwrap() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let (events, _) = process.finish(130, "cancelled").await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["message"]["output"]["code"] == "cancelled")
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!dir.path().join("escaped").exists());
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn debug_cli_rejects_stdin_prompt_and_regular_file_control_input() {
+    let dir = tempfile::tempdir().unwrap();
+    for stdin_prompt in [true, false] {
+        let input = tempfile::tempfile().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_turnforge"))
+            .args([
+                "debug",
+                if stdin_prompt { "-" } else { "fixture" },
+                "--model",
+                "fixture",
+                "--base-url",
+                "http://127.0.0.1:1/v1",
+                "--workspace",
+            ])
+            .arg(dir.path())
+            .env_clear()
+            .stdin(Stdio::from(input))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(if stdin_prompt {
+                "stdin is reserved"
+            } else {
+                "pipe"
+            }),
+            "{stderr}"
+        );
+    }
+}

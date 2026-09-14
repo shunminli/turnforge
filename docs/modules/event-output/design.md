@@ -5,27 +5,45 @@
 
 ## 接口与字节投影
 
-`forward(events: Receiver<Event>, json: bool, cancel: &CancellationToken) -> io::Result<()>`。
+`forward(events: Receiver<OutputItem>, mode: DisplayMode, cancel: &CancellationToken) -> io::Result<()>`。
 函数获得 receiver 所有权，借用取消 token；自身不修改 token，出错后的取消由 CLI writer 包装层负责。
 它首先创建 Output，再依次 `recv`、编码并完整写入当前事件，然后读取下一事件。
+`OutputItem::{Event(Event), Notice(String)}` 是 binary 内桥接，`DisplayMode::{Json,Text,Lab { lesson, automatic }}` 控制投影。
+Notice 直接写传入文本，当前只有 learn/Lab 文本路径生产它；普通 run/debug 的 Json 路径不排队 Notice。
+因此原有 NDJSON 形状不变，不能给 Json 路径随意新增 Notice 后仍宣称纯 Event stream。
 
 | 模式 / 事件 | 写入内容 |
 |---|---|
 | JSON / 任意 Event | `serde_json::to_vec(event)` 后追加一个 LF |
 | 文本 / ModelDelta::Text | 原始 UTF-8 text 字节，不自动插入间隔 |
 | 文本 / RunFinished | 一个 LF，不显示 outcome |
+| 文本 / DebugPaused | 暂停 ID、pretty JSON snapshot、该 ID 的命令提示 |
+| 文本 / DebugSnapshot | Inspect 快照 ID、pretty JSON snapshot、命令提示 |
+| 文本 / DebugResumed | `[debug resumed #ID]` 通知 |
+| 文本 / DebugCommandRejected | 被拒绝命令的 JSON 和 reason，不输出用户无效输入原文 |
 | 文本 / 其它事件 | 忽略，不调用 write |
+| Lab / StepStarted、ToolStarted、Tool committed | 模型进度、工具及参数预览、工具结果预览 |
+| Lab / DebugPaused | ID、point、next、消息/待调用计数；可选 learning::hint；快捷键或 auto 提示 |
+| Lab / DebugSnapshot | i 请求的完整 pretty JSON 快照 |
+| Lab / DebugResumed、Rejected、RunFinished | 恢复、拒绝原因、运行 outcome；运行 outcome 不是 oracle 结果 |
+| Notice | 原样 UTF-8 文本，承载 Lab 说明/帮助/课程/PASS/FAIL 或离线 learn |
 
-不追加额外成功信息或 stderr 进度；详细 Event 字段见 [协议设计](../protocol/design.md)。
+普通 run/debug 不追加额外成功信息或 stderr 进度；Lab 的额外验收 Notice 由宿主生成，不由 writer 自行判断。
+详细 Event 字段见 [协议设计](../protocol/design.md)。
+调试提示与快照属于 stdout 文本投影；`--json` 不混入这些提示，而是直接序列化对应 Event。
 文本 delta 与 MessageCommitted 不重复显示，但每个模型步骤的 Text delta 都可能显示。
 JSON 不保证全行原子写入，尤其事件大于 pipe 缓冲时；断开/超时可能留下半行。
+Lab 的参数/工具结果 preview 先序列化完整 JSON，再取前 1200 个 Unicode char，超过时追加截断提示。
+此限额只控制显示篇幅，不限制序列化分配/原始快照大小；i 可查看完整快照，不进行脱敏。
+自动模式也显示暂停摘要，但自动 Step 已由 sink 驱动；不能将 writer 显示时间当作 Agent 当时仍等待用户。
 
 ## 队列合同（CLI 对接）
 
-容量在 [main.rs](../../../src/main.rs) 固定为 64 个 Event，通过 `try_send` 入队。
+容量在 [main.rs](../../../src/main.rs) 固定为 64 个 OutputItem，通过 `try_send` 入队；离线 learn 是 1 项。
 full 与 closed 合并为同一诊断；首次失败后 sink 不再投递，并请求取消。
 队列不是字节限额，没有 terminal 专用槽位，也不会重试失败事件。
-run 返回时 drop Sender；健康 writer 排空已有事件后收到 None，返回 Ok。
+run 完成后排队 Lab 验收报告并 drop 自己的 Sender；run_done 停止 control 后关闭其 Sender。
+健康 writer 等全部发送者关闭，排空已有项后收到 None，返回 Ok。
 取消不会关闭 receiver，也不会跳过排空；输出故障才会使 forward 提前返回。
 
 ## stdout fd 初始化与释放
@@ -50,7 +68,7 @@ File 分支直接调用同步 `std::io::Write::write_all`，没有异步抢占�
 
 ## 精确写入 deadline 语义
 
-forward 为**每个要输出的事件**创建并 pin 一个 write future，随后执行 biased select：
+forward 为**每个要输出的 Event 或 Notice**创建并 pin 一个 write future，随后执行 biased select：
 
 ```text
 cancel.cancelled() 就绪 → timeout(100ms, 同一个 write future)
@@ -67,6 +85,7 @@ token 已取消时，后续每个待写事件都会各自获得 100ms 尝试；�
 任一事件超时立即返回 TimedOut：`stdout stalled; output may be incomplete`，不会继续写后续事件。
 等待 `events.recv()` 本身没有取消 select；即使 token 已取消，仍要等 run 关闭 Sender 或产生事件。
 事件序列化发生在 timeout 之前，也不计入该写入预算。
+调试 pretty JSON 同样在写入预算前构造，历史很长时的复制/序列化成本不受 2 秒写入 timer 限制。
 
 对 File 分支，同步 write 一旦阻塞，Tokio timeout 不能中断系统调用。
 普通本地文件和 /dev/null 的成功路径受支持；网络/特殊文件系统挂起不在取消时延保证范围内。
@@ -86,8 +105,14 @@ CLI 在 writer 返回错误时取消 run，等待 join，并让输出错误优�
 `stdout_can_be_redirected_to_a_regular_file_or_dev_null` 覆盖本地普通文件和 /dev/null 成功路径。
 `a_full_batch_of_immediate_tool_errors_does_not_overflow_output` 覆盖 32 个立即失败工具的事件排空。
 `actual_ctrl_c_cancels_shell_and_preserves_event_closure` 验证健康消费者下取消事件闭合，不代表故障端必达。
+`debug_cli_steps_real_tool_effects_and_finishes_with_stdin_open` 覆盖调试 NDJSON 事件与输入命令的交互，
+`debug_cli_sigint_during_shell_awaits_cleanup_and_closes_calls` 覆盖调试取消的健康输出端闭合。
 
-尚无专门测试强制 queue full、broken pipe、TTY flag 恢复、两种 timer 同时就绪或普通文本模式。
+[lab_cli.rs](../../../tests/lab_cli.rs) 的 `lab_default_read_shortcuts_pause_inspect_and_finish_with_stdin_open`
+通过真实文本 stdout 检查暂停/Inspect/课程与最终报告；`learn_catalog_and_lessons_need_no_llm`
+覆盖离线 Notice 交付。它们不证明所有模式的 stdout 故障分支或自动化屏幕体验。
+
+尚无专门测试强制 queue full、broken pipe、TTY flag 恢复、两种 timer 同时就绪或普通 run 文本模式。
 现有测试不是全局延迟证明，也没有覆盖网络文件系统挂起或恢复 flags 失败。
 
 ## 变更检查清单

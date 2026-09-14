@@ -9,6 +9,7 @@
 |---|---|
 | `Agent::new(model, tools, config)` | 转移三个值的所有权，建立空历史与 Ready 状态 |
 | `run(&mut self, input, &CancellationToken, &mut FnMut(Event))` | 异步推进一个 user turn，返回 `Result<RunOutcome, AgentError>` |
+| `run_debug(&mut self, input, DebugSession, &mut FnMut(Event))` | 消费一次调试会话，复用同一循环和返回类型；在安全边界等待控制 |
 | `messages(&self) -> &[Message]` | 只读历史，不含 system 配置 |
 | `state(&self) -> &RunState` | 只读运行状态，不能外部改写 |
 
@@ -18,7 +19,7 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 
 ## 接受 run 与状态推进
 
-1. 当前为 Running 时，返回 `AgentError::Interrupted`，不产生新事件。
+1. 当前为 Running 或 Paused 时，返回 `AgentError::Interrupted`，不产生新事件。
 2. 将 input 转 String，空白输入返回 `EmptyInput`；原字符串非空时完整保留，不自动 trim 存储。
 3. 设置 `Running { step: 0, phase: Model }`，发 RunStarted，再提交 User。
 4. 快照当前可见工具定义；step 从 1 到 max_steps，每轮开始检查取消。
@@ -29,6 +30,11 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 
 默认接受任何 Finished 后的下一次 run；同一个 Agent 保留上一次用户输入及已提交历史。
 模型错误不会撤销已有 User；没有“失败 run 自动回滚到之前”的逻辑。
+
+上面描述普通 `run` 的自动运行路径。调试路径在初始模型前、完整 Assistant 提交后、
+每条 Tool 结果提交后调用安全 checkpoint；Step/Continue 决定继续方式，Cancel 仍沿本循环结束。
+最后无工具回复和达到上限的最后工具结果均可在终态前检查；调试用户还需释放 `Finish` 动作。
+快照、Pause/Inspect、ID 校验和消息中间态见[调试设计](../debugger/design.md)，不另建一份 Agent 执行实现。
 
 ## 模型响应与工具批次
 
@@ -51,7 +57,7 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 
 | 条件 | run 返回 | 历史与事件 |
 |---|---|---|
-| 未接受：Running / 空输入 | Err(Interrupted / EmptyInput) | 不产生新 RunStarted |
+| 未接受：Running 或 Paused / 空输入 | Err(Interrupted / EmptyInput) | 不产生新 RunStarted |
 | token 在 step 前取消 | Ok(Cancelled) | 已接受的 User 保留；不再请求模型 |
 | 模型等待期间取消 / 模型返回 Cancelled | Ok(Cancelled) | 丢弃未完成的模型响应，不提交半条 Assistant |
 | 模型 HTTP/协议/transport 错误或非法 Assistant | Err(Model(...)) | 设置 Failed，已有消息保留，发 RunFinished(Failed) |
@@ -59,6 +65,7 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 | 工具运行期间 token 取消 | Ok(Cancelled)（清理和配对后） | 当前工具返回实际结果，剩余调用补 cancelled |
 | 助手不再调用工具 | Ok(Completed)，或取消已观察时 Cancelled | 完整 Assistant 已提交 |
 | 最后一步仍产生工具调用且未取消 | Ok(StepLimit) | 所有调用都有结果，无额外模型总结 |
+| 调试暂停处取消 | Ok(Cancelled) | 已提交结果保留，待执行调用补 cancelled；不再等待人工释放 |
 
 工具返回一个 code 为 `cancelled` 的输出，并不会单独让 Agent 结束；是否结束仍由 token 决定。
 同理，工具 timeout 不是 Agent 的总超时。`RunOutcome::Failed` 作为状态/事件使用，当前错误路径返回 Err，
@@ -70,7 +77,7 @@ Model 调用置于 biased select，取消优先；其实现必须允许 future �
 Tool 调用不放在外层 cancel-select 中，避免丢弃执行 future 造成子进程/文件 worker 失去清理 owner。
 工具内 token check 和清理实现的边界见[文件设计](../filesystem-tools/design.md)与[Shell 设计](../shell-tool/design.md)。
 
-宿主正确用法是发 token 后继续 await run。若直接 timeout/drop/task.abort，Running 状态不会自动改为 Finished，
+宿主正确用法是发 token 后继续 await run。若直接 timeout/drop/task.abort，Running/Paused 状态不会自动改为 Finished，
 后续调用被 Interrupted 拒绝；没有重新绑定中断现场的恢复 API。
 正常完整等待、无 panic 的路径才保证每个已接受 run 发一个 terminal event。消费者能否收到另属输出合同。
 
@@ -98,3 +105,4 @@ Tool 调用不放在外层 cancel-select 中，避免丢弃执行 future 造成�
 尚无空输入、超过 32 个调用、所有 panic/drop 时点、超长会话的穷尽测试；也无持久化恢复或并行工具合同。
 修改时检查：step 计数定义、terminal 位置、所有调用配对、模型/工具不同的取消策略、
 event sink 是否还非阻塞、同步完成路径是否仍让出调度。新并发或恢复能力先补跨模块设计与真实失败用例。
+调试专属命令与安全边界验收集中在[debugger 设计](../debugger/design.md#测试与变更检查)，避免重复维护两套合同。

@@ -17,6 +17,9 @@ A lightweight agent harness in Rust, built for explicit state, reliable executio
 - 默认只读；写文件和 shell 必须分别显式授权。
 - Ctrl-C 协作取消、模型请求超时、shell 超时、Unix 进程组清理、输出限额。
 - NDJSON 事件接口；本地 HTTP → 真实 CLI → 文件/子进程的集成测试。
+- 原生语义调试：模型前、完整回复后、每个工具结果后暂停，支持 Step/Continue/Pause/Inspect/Cancel。
+- 本地 Harness Lab：固定 Ollama 预检、临时 chat/read/write 场景、快捷单步和独立结果验收。
+- 六阶段学习路线：`learn` 离线看课程，`lab --lesson` 在暂停点联系源码解释原理。
 
 ## 快速开始
 
@@ -49,6 +52,20 @@ cargo run --locked -- run '在 README.md 中补充测试说明' --workspace . --
 非思考小模型，使用 `turnforge-test:qwen3-4b-v1` 跑真实 API/工具闭环。服务只监听本机，前台启动，
 不设置开机启动；模型权重不进入仓库。
 
+已经准备好本地 Ollama 时，直接体验 Harness，无需填写模型或 workspace：
+
+```sh
+bash scripts/harness-lab.sh                         # 默认 read，Enter 单步
+bash scripts/harness-lab.sh --case read --auto      # 无需 stdin，真实工具/答案验收
+bash scripts/harness-lab.sh --case write --lesson tools
+cargo run --quiet --locked -- learn                # 不调用模型的六阶段学习路线
+```
+
+Lab 只使用临时合成文件，write 场景才授权文件写入，始终不授权 shell；退出后清理临时目录。
+`n/Enter` 下一步、`c` 继续、`i` 完整现场、`p` 暂停、`q` 取消、`l` 课程、`h` 帮助。
+脚本不自动安装、下载或启动 Ollama；服务未运行时，在另一终端执行 `bash scripts/serve-local-llm.sh`。
+完整示例和边界见[Lab 指南](docs/harness-lab.md)，边跑边学见[学习指南](docs/harness-learning.md)。
+
 授权执行 shell（拥有宿主机权限，请先读下面的安全边界）：
 
 ```sh
@@ -63,6 +80,10 @@ cargo run --locked -- run '分析项目' --max-steps 10 --request-timeout 120 --
 cargo run --locked -- run --help
 ```
 
+逐步学习或检查 Harness 执行过程，可使用 `turnforge debug PROMPT`；它运行同一个 Rust Agent，
+stdin 专门接收 `step ID`、`continue ID`、`inspect ID`、`pause`、`cancel` 命令。
+调试不会自动授权工具，也不是源码逐行断点或持久化恢复。完整示例和自动化方式见[调试指南](docs/debugging.md)。
+
 `--json` 的 stdout 每行一个事件。事件包含用户输入、模型文本、工具参数和结果，
 可能包含敏感数据；不要随意上传。普通文本模式中的流式文本是暂态结果，是否成功以结束状态为准。
 输出使用有界队列和非阻塞管道；下游不消费、队列溢出或写入持续阻塞会终止运行。
@@ -70,6 +91,7 @@ cargo run --locked -- run --help
 
 退出码：`0` 模型自然结束，`1` 运行/协议错误，`2` 达到步数上限（也是 CLI 参数错误码），
 `130` 取消。自然结束不等于用户任务一定完成；宿主仍需检查结果和文件。
+Lab 在 Completed 后另做场景验收，只有 oracle 满足且输出成功才退出 0；课程提示不改变 PASS 条件。
 
 ## 安全与范围
 
@@ -102,7 +124,7 @@ cargo build --locked --release
 需要显式启用且不替代 CI 确定性门禁。`Cargo.lock` 纳入版本管理。
 CI 已配置 macOS/Linux 门禁；远端结果要在推送后确认。
 
-维护入口是[文档总索引](docs/README.md)。8 个核心模块分别有独立的架构与设计文档，
+维护入口是[文档总索引](docs/README.md)。11 个核心/宿主模块分别有独立的架构与设计文档，
 涵盖职责、所有权、接口、状态、取消/错误、安全边界及对应测试。
 
 建议依次阅读[系统架构](docs/architecture.md)、[协议设计](docs/modules/protocol/design.md)、

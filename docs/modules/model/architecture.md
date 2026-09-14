@@ -37,6 +37,11 @@ CLI 宿主构造 OpenAiModel（endpoint / key / model / timeout）
 模型适配器不访问工作区、`ToolRegistry::execute` 或会话的可变引用。
 事件包装、消息提交和工具结果回填由 [agent.rs](../../../src/agent.rs) 完成。
 
+通用 run/debug 使用 `OpenAiModel::new`；本地 [Lab](../harness-lab/architecture.md) 使用
+`OpenAiModel::new_local`，构造时限定字面 loopback 地址、没有 key 参数并显式禁用环境代理。
+两者复用私有构造和同一请求/SSE 路径，不通过修改进程全局环境临时切换网络策略。
+Ollama 版本/digest 检查不属于通用 provider，仍由 Lab 预检负责。
+
 ## 3. Ownership 与生命周期
 
 | 对象 | owner / 借用关系 | 生命周期与可变状态 |
@@ -92,7 +97,7 @@ provider 的请求转换可以变化，但不能越过 Agent 的消息提交边�
 
 ## 7. 维护入口
 
-先读 [Model contract](../../../src/model.rs)，再读 `OpenAiModel::new/request` 和 `Assembly`。
+先读 [Model contract](../../../src/model.rs)，再读 `OpenAiModel::new/new_local/request` 和 `Assembly`。
 主要跨边界证据是 [cli_http.rs](../../../tests/cli_http.rs)：真实 TCP → CLI → 文件 → 下一次请求。
 Agent 对模型失败和取消的处理由 [agent.rs 测试](../../../tests/agent.rs)补充。
 具体用例映射、尚未覆盖的协议分支与修改清单见[设计文档](design.md)。
