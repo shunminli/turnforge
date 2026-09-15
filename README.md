@@ -23,8 +23,13 @@ A lightweight agent harness in Rust, built for explicit state, reliable executio
 
 ## 快速开始
 
+第一次想通过调试理解 Harness，请从 [完整 step-by-step 学习教程](docs/harness-learning.md) 开始：
+[环境准备](docs/tutorial/00-setup.md) → 六个实验 → [自己写一个权限测试](docs/tutorial/07-capstone.md)。
+每章包含操作、预期现象、源码解读和自检答案；不需要先运行 CLI 才能阅读。
+
 开发和 shell 工具目前以 **macOS / Linux** 为目标。需要 Rust/rustup 和 `/bin/bash`。
 仓库通过 `rust-toolchain.toml` 固定已验证的 Rust 版本。
+以下命令在克隆得到的 `turnforge` 仓库根目录执行，先确认当前目录里有 `Cargo.toml`。
 
 ```sh
 source "$HOME/.cargo/env"

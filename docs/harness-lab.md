@@ -67,13 +67,15 @@ EOF 触发取消；输入与运行结束竞速时不会改写已经完成的结�
 ## 边调试边学
 
 ```sh
-target/debug/turnforge learn
+cargo run --quiet --locked -- learn
 bash scripts/harness-lab.sh --case read --lesson loop
 bash scripts/harness-lab.sh --case write --lesson tools
 ```
 
 `--lesson` 在暂停点加上当前位置原理、源码符号和观察问题，不修改场景 prompt、权限、调度或验收条件。
-六阶段学习路线与人工验收标准见[Harness 学习指南](harness-learning.md)。课程不自动判断是否学会，不存储学习进度。
+逐步操作、预期现场、源码解读和自检答案见[Harness 完整学习教程](harness-learning.md)。
+首次使用先完成[环境准备](tutorial/00-setup.md)；上面的 Cargo 命令会按需构建，不依赖已存在的 target/debug 二进制。
+课程不自动判断是否学会，不存储学习进度。
 
 ## 固定配置与诊断
 
