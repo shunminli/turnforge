@@ -1,50 +1,74 @@
-# 边调试边学习 Harness
+# 从调试到理解实现：Turnforge 完整学习教程
 
-学习入口有两种；两者共享同一套课程内容：
+这是一条可以照着做的路径，不要求先通读整个仓库。你会先跑通一次真实的模型—工具循环，
+再分别理解上下文、权限、暂停和输入输出，最后亲手写一个测试来证明自己理解了边界。
+目标不是记住六个命令，而是能回答：**谁拥有状态，谁决定下一步，谁执行副作用，失败时谁负责收尾？**
+
+**第一次学习请从 [第 0 章：准备环境](tutorial/00-setup.md) 开始，然后点每章末尾的“下一章”。**
+不要直接执行 `target/debug/turnforge`：那是本地构建产物，不随 Git 下载，且相对路径依赖当前目录。
+
+## 完整路径
+
+| 顺序 | 章节 | 实际要做的事 | 学完应留下的证据 |
+|---|---|---|---|
+| 0 | [准备环境与阅读地图](tutorial/00-setup.md) | 找到仓库、运行离线课程、检查本地模型、区分终端 A/B/C | 能独立启动课程；知道每个进程在哪个终端 |
+| 1 / `loop` | [亲手走完一次 Agent 循环](tutorial/01-loop.md) | 一次只推进一个动作，比较下一动作和消息变化 | 一张“动作 → 新消息 → 下一动作”记录 |
+| 2 / `context` | [看懂上下文如何进入和离开模型](tutorial/02-context.md) | 对比工具前后的快照，追踪 call ID 与 SSE 提交边界 | 能指出下一次模型请求会多看到什么 |
+| 3 / `tools` | [证明工具权限与副作用](tutorial/03-tools.md) | 工具前看参数，工具后在另一个终端读真实文件 | 能区分模型提议、授权、执行结果和磁盘事实 |
+| 4 / `control` | [理解单步、继续与取消](tutorial/04-control.md) | Inspect/Step/Cancel，结合确定性测试读 pause ID 与 epoch | 能解释旧命令为何不能释放未来暂停 |
+| 5 / `io` | [理解宿主的输入输出与生命周期](tutorial/05-io.md) | 对比交互 EOF、自动模式和输出阻塞测试 | 一张 run/control/writer 的结束责任表 |
+| 6 / `regression` | [判断“跑完”是不是真的“通过”](tutorial/06-regression.md) | 对比 chat/read/write 的验收事实与可控失败 | 一张模型问题、Harness 问题、环境问题分类表 |
+| 7 | [综合练习：自己写一个权限测试](tutorial/07-capstone.md) | 从零写一个小型集成测试，验证拒绝和允许两条路径 | 自己的测试、三条独立断言、一次完整执行解释 |
+
+这是教学顺序，不是严格代码依赖：第 4 章主要依赖第 1 章，第 6 章主要依赖第 1–3 章。
+CLI 仍只有六个课程名；第 0、7 章是文档课程，不是新增 `--lesson` 选项。
+
+## 每一章怎么学
+
+1. **先读目标和前置**，不要把全部命令一次粘贴进终端。
+2. **先预测**：下一次操作会请求模型、执行工具，还是仅返回快照？
+3. **执行一步**，观察 `point`、`next`、`messages`、`pending_calls` 和实际文件。
+4. **读指定实现**：从一两个函数进入，回答它的输入、状态 owner、提交点和退出路径。
+5. **运行已有确定性测试**，确认你看到的现象背后有哪些硬性断言。
+6. **先独立回答自检，再展开参考答案**；不能解释的地方回到现场，不靠重复运行刷 PASS。
+
+可以每次学一章；第 1–3 章建议连续完成，再进入生命周期和故障路径。
+每章不需要先精通 Rust：遇到 `&mut`、借用、`async`、`Drop` 时，先查第 0 章的最小词表。
+
+## 文档、CLI、模型各负责什么
+
+完成第 0 章、进入仓库根目录并加载 Cargo 后：
 
 ```sh
-target/debug/turnforge learn
-target/debug/turnforge learn context
+cargo run --quiet --locked -- learn
+cargo run --quiet --locked -- learn loop
 bash scripts/harness-lab.sh --case read --lesson loop
 ```
 
-`learn` 只显示总路线或单课，不需要 Ollama、不读取工作区、不请求模型。
-`lab --lesson` 在每个暂停点给出简短解释、源码符号和观察问题；按 `l` 查看完整课件、`i` 看逻辑快照。
-它不让 LLM 生成教程，不修改 prompt、工具权限、调度路径或 PASS 条件，不自动记录学习进度。
+- **这套文档**：完整操作、原理、排障、自检和参考答案，不要求运行 CLI 才能看到教学内容。
+- **`learn` / 实验中按 `l`**：简短课程卡片，供操作时快速回顾；不存进度、不自动判分。
+- **`lab --lesson`**：在真实暂停点给源码提示；`i` 是完整逻辑快照，`n` 才推进。
+- **本地 LLM**：执行合成任务；它可能选不同工具、返回不同文字，也可能出错，不负责生成教程。
 
-## 六阶段路线
+没有模型服务时，仍可读全部课程、运行 `learn` 和各章的确定性测试；标有 Lab 的真实实验需要完成本地模型准备。
+语义暂停不是源码行级断点；快照不是原始 HTTP payload 或可恢复存档。取消不回滚已有副作用。
 
-| 阶段 | 先掌握什么 | 调试练习 | 人工验收：能解释或指出 |
-|---|---|---|---|
-| `loop` | 一次 User turn 可含多次模型/工具动作 | read 逐次 n，先预测 next 再执行 | 模型 step ≠ 调试动作；最终 Finish 为什么单独确认 |
-| `context` | delta 暂态、完整消息提交 | 工具前后 i，比较 messages 与 pending_calls | call ID 配对；逻辑快照不是原始 HTTP 请求或恢复点 |
-| `tools` | 模型提议，宿主授权和执行 | write 在工具前后观察；另一次 q 取消 | 可见工具与执行权限；预览不等于副作用，取消不是回滚 |
-| `control` | 安全边界及协作取消 | i/n/c/p/q，比较不推进、推进与退出 | pause ID 和 epoch 防止旧/预送命令放行未来暂停 |
-| `io` | headless core 与终端宿主分工 | 交互 read，再 `--case read --auto </dev/null` | run/control/writer 的结束责任；发 Event 不等于已交付 |
-| `regression` | 模型自然结束与用户任务成败不同 | chat/read/write --auto | PASS 的独立消息/磁盘证据；真实小模型不替代确定性故障回归 |
+## 学习记录模板
 
-每一课的完整前置、命令、源码入口和问题以 `turnforge learn LESSON` 为准。
-建议一次只改一个观察点：先预测下一动作，再单步，最后用现场事实解释预测是否正确。
-短模型运行可能在输入 `p` 前完成；这不证明暂停失效，Pause 只能作用于尚未跨过的安全边界。
+复制到自己的笔记，每次实验填写一份即可。运行时不会替你保存这些记录。
 
-## 从现象定位实现
+```text
+章节 / 场景：
+我预测的下一动作：
+实际 point / next / step：
+新增的 Message 与 call_id：
+真实文件或进程事实：
+解释这一事实的源码符号：
+哪个对象拥有状态？谁负责结束？
+测试断言证明了什么，又没证明什么？
+仍不能解释的问题：
+```
 
-- 调度：`src/agent.rs::Agent::run_loop`，单 writer 创建请求、提交 Assistant 和 Tool。
-- 上下文：`src/model.rs::ModelRequest` 是借用；`Agent::checkpoint` 输出 owned 快照。
-- 执行权：`src/tools/mod.rs::ToolRegistry::execute` 再查权限；文件副作用由 FileTool 完成。
-- 控制：`src/debug.rs::DebugSession::checkpoint` 等待安全命令，不把工具 future 丢弃。
-- 宿主：`src/main.rs` 组合控制/事件/信号，`src/output.rs::forward` 管交付和写入限制。
-- 验收：`src/lab.rs` 对最终提交与实际文件做独立检查，不依靠模型自评。
-
-源码入口使用仓库相对路径与符号，不固定易漂移的行号；入口可能是 private helper，也可直接定位阅读。
-暂停提示只使用 DebugSnapshot 的逻辑事实，不知道网络原始 payload、模型内部思考或尚未执行动作的结果。
-
-## 能力边界
-
-课程是维护者编写的观察计划，不是“完成六课即掌握”的自动认证。没有测验判分、持久化进度、用户画像、
-按源码行断点、历史编辑或 LLM Space 接入。学习不影响实验原有的预检、权限、取消和独立 oracle。
-长历史快照仍有复制和序列化成本；课件不提供秘密脱敏或资源预算保证。
-
-入门实验步骤见[Harness Lab 指南](harness-lab.md)，深层合同从[模块索引](README.md)进入。
-课程自身的维护边界见[学习架构](modules/learning/architecture.md)与[学习设计](modules/learning/design.md)。
-本轮实际执行过的学习实验与验证边界见[验收记录](verification/harness-lab-2026-09-14.md)。
+长期模块合同从[架构与设计索引](README.md)进入；快捷键参考 [Lab 指南](harness-lab.md)。
+教程讲现有实现，不代表已经接入 LLM Space、支持进度持久化、历史编辑或 OS sandbox。
+课程模块自身的边界见[学习架构](modules/learning/architecture.md)与[学习设计](modules/learning/design.md)。

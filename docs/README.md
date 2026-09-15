@@ -3,6 +3,9 @@
 这里是维护者入口，描述当前 M0 实现，不是所有规划功能已经落地的声明。
 首次了解项目先读[系统架构](architecture.md)，修改代码前进入对应模块的架构与设计文档。
 
+想边调试边学习？从[完整学习教程](harness-learning.md)的[第 0 章：环境准备](tutorial/00-setup.md)开始，
+按六个实验逐步阅读源码，最后[自己编写权限测试](tutorial/07-capstone.md)。无需先启动 CLI 才能阅读课程。
+
 ## 文档分工
 
 - **架构文档 / architecture.md**：模块为何存在、负责与不负责什么、上下游关系、所有权与生命周期、取舍。
@@ -54,7 +57,7 @@
 - [本地 LLM 指南](local-llm.md)：固定 Ollama/小模型基线、前台服务生命周期与显式启用的真实模型冒烟。
 - [原生调试指南](debugging.md)：语义单步、只读快照、控制命令、CLI 自动化和能力边界。
 - [Harness Lab 指南](harness-lab.md)：一键启动合成实验、快捷控制和固定本地模型验收。
-- [Harness 学习指南](harness-learning.md)：六阶段路线、源码入口和边调试边学的人工 rubric。
+- [Harness 完整学习教程](harness-learning.md)：环境准备、六个逐步实验、源码解读、自检答案与综合编程练习。
 - [Lab 与学习实现计划](harness-lab-plan.md)：入口、权限、生命周期及本轮完成证据。
 - [Lab 与学习验收记录（2026-09-14）](verification/harness-lab-2026-09-14.md)：冻结实现、首次失败、独立门禁和真实用户入口验证。
 - [调试实现计划](debugging-plan.md)：本轮实现范围与验收台账，不代替模块当前设计。
