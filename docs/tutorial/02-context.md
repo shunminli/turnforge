@@ -3,7 +3,7 @@
 [学习总入口](../harness-learning.md) · 上一章：[01 调度循环](01-loop.md) · 下一章：[03 工具与权限](03-tools.md)
 
 本章目标：从暂停现场追踪消息，理解借用、owned 快照、流式增量与提交边界为什么要分开。
-前置：完成 [00 环境准备](00-setup.md)和第 01 章，能根据 `next.kind` 单步；仍在仓库根目录。
+前置：完成 [00 课程准备](00-setup.md)和第 01 章，能根据 `next.kind` 单步；仍在仓库根目录。
 预计 35–50 分钟。本章只观察合成上下文，不修改提示词、源码或历史。
 
 ## 1. 新开一次有上下文提示的实验
@@ -13,7 +13,8 @@ cargo run --quiet --locked -- learn context
 bash scripts/harness-lab.sh --case read --lesson context
 ```
 
-在首次暂停输入 `i`。如果没有进入暂停，按第 00 章排查，不把预检错误当作模型执行结果。
+在首次暂停输入 `i`。如果没有进入暂停，按 [Lab 诊断参考](../harness-lab.md)定位；
+服务或模型预检错误转到[本地 LLM 环境指南](../local-llm.md)，不把预检错误当作模型执行结果。
 这次关注四个字段：`system`、`messages`、`tools`、`pending_calls`。
 先用自己的话各写一句含义，再继续执行。
 

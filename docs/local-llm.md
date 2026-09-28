@@ -1,20 +1,16 @@
-# 本地 LLM：安装、运行与冒烟测试
+# 本地 LLM：安装、基线与服务生命周期
 
 本指南用独立的 Ollama 服务，为 Turnforge 提供本机 Chat Completions SSE API。
 它不改变 Harness 的模型接口，不引入模型权重到 Git，也不安装开机启动服务。
+本页只负责本地模型环境，不编排 Harness 学习或回归流程。
+首次跑通看 [101 用户指南](101-user-guide.md)，测试命令与验收看[测试参考](testing.md)，
 返回[文档索引](README.md)；协议边界见[模型设计](modules/model/design.md)。
 
-## 1. 两层测试，各自负责什么
+## 1. 使用前提
 
-| 层次 | 入口 | 能证明什么 | 不能证明什么 |
-|---|---|---|---|
-| 确定性回归，默认 CI | `cargo test --locked --all-targets`；[现有测试](../tests/cli_http.rs)等 | 人工构造的合法/异常协议、权限、取消、真实 CLI 与文件/进程合同 | 模型是否会选择合适工具、某个真实服务的兼容性 |
-| 真实本地模型冒烟，显式启用 | [local_llm.rs](../tests/local_llm.rs) | 本机服务 → SSE → CLI → 工具 → 模型继续回答的真实闭环 | 全量协议覆盖、复杂 coding 能力、所有机器上稳定通过 |
-
-真实模型测试默认 `#[ignore]`，不会自动安装、下载或启动服务；普通 CI 不依赖模型。
-保留确定性回归作为门禁，不能用小模型冒烟替代它。`temperature=0` 和固定 seed
-用于减少采样变化，不保证跨硬件、runtime 版本或输入变化时逐 token 一致。
-失败不能靠反复重跑到绿来消除，应区分 Harness 故障、服务/基线漂移与模型行为变化。
+安装、下载和创建别名是显式的环境操作，Lab 与回归测试不会自动执行它们。
+已有匹配环境时直接复用，不需要每次重新安装或下载。首次仓库/Rust 准备见
+[101 用户指南](101-user-guide.md)；两层测试的分工见[测试参考](testing.md)。
 
 ## 2. 固定的测试基线
 
@@ -46,7 +42,7 @@ source digest 用于基线溯源，不是测试每次重新下载源模型的指
 
 以下使用官方 macOS standalone bundle，在用户数据目录安装固定版本。
 Linux 需使用对应平台的官方 release artifact 并独立校验 SHA；不要运行 macOS 包。
-Rust 工具链安装沿用[项目快速开始](../README.md#快速开始)。
+Rust 工具链与仓库准备见 [101 用户指南](101-user-guide.md)。
 
 从仓库根目录执行。命令拒绝覆盖已有版本目录，先校验 SHA-256 再解压；不使用 `curl | sh`：
 
@@ -122,64 +118,13 @@ Ollama 兼容 API 不直接接收 `num_ctx`，因此参数由 Modelfile 负责�
 
 ## 5. 运行测试和手工体验
 
-先跑默认回归，再显式跑真实模型用例，禁止并发争抢单模型服务：
-
-```sh
-cargo test --locked --all-targets
-cargo test --locked --test local_llm -- --ignored --test-threads=1 --nocapture
-cargo test --locked --release --test local_llm -- --ignored --test-threads=1 --nocapture
-```
-
-这里的 `--ignored` 显式选择真实模型用例，`--test-threads=1` 让同一测试进程串行执行；
-它不防止两个终端同时发起测试，因此 debug/release 两条命令也要依次等待完成。
-查看用例而不调用模型可运行 `cargo test --locked --test local_llm -- --list`。
+测试操作已统一到[真实模型回归](testing.md#真实模型回归)；首次体验见
+[101 用户指南](101-user-guide.md)，自定义模型与 prompt 见 [CLI 使用参考](cli.md)。
+保留本节标题以兼容已有链接，不再维护第二份测试或手工运行流程。
 
 ### 用例矩阵
 
-实现与断言以 [local_llm.rs](../tests/local_llm.rs) 为准，以下 ID 用于报告关联，不是额外测试：
-
-| ID / 测试符号 | 输入与权限 | 独立验收依据 |
-|---|---|---|
-| LLM-001 / `local_llm_plain_text_stream_completes` | 临时空目录；一句问候；只读 | 存在非空文本增量和最终回答；没有工具调用；正常结束 |
-| LLM-002 / `local_llm_reads_unknown_file_marker` | 测试预写 `marker.txt`；只读；prompt 不包含临时生成的 marker | 成功的 `read_file` 结果和最终回答都包含预写 marker；不是模型猜中固定答案 |
-| LLM-003 / `local_llm_writes_file_and_finishes` | 临时空目录；仅显式开启 `--allow-write` | 独立读取磁盘 `result.txt`，精确等于 `turnforge-local-write-ok`，无末尾换行；成功的 `write_file` 结果路径和字节数匹配；随后模型正常结束 |
-| LLM-004 / `local_llm_debug_steps_through_read_and_final_answer` | `debug` 子命令；只读临时 `marker.txt`；prompt 不含动态 marker | 自动读暂停事件再发带 ID 的 Step；检查工具前预览、read_file 结果及 AfterTool 快照包含 marker，最终答案匹配，释放 Finish 后成功退出 |
-
-共同断言包括：
-
-- 推理前检查 Ollama 版本和测试模型完整 digest；不可达、缺模型或漂移都失败，不自动跳过。
-- CLI 成功退出；stdout 是 NDJSON；恰有一对 `run_started` / `run_finished`，首尾有序且 outcome 为 `completed`。
-- 每个工具开始事件对应已提交的调用，每个结果关闭已开始的调用；新 Assistant 之前上一批调用已闭合。
-  调用 ID 只要求同一 Assistant 消息内唯一，不固定模型生成的 ID 或工具顺序。
-- 最后提交的是没有待执行工具、文本非空的 Assistant，不把仅有流式增量当作完整回答。
-
-前三个用例走普通 `run`，LLM-004 走同一 Agent 的原生调试路径。调试驱动保持 stdin 开放，
-只有收到 `debug_paused` 后才提交当前 ID 的 Step；首个快照只含 User，pause ID 按实际暂停递增，version 为 1。
-它验证真实模型可以穿过模型—工具—结果—最终回答的单步闭环，不要求固定暂停总数或具体模型 call ID。
-手工控制、EOF 取消与机器驱动注意事项见[原生调试指南](debugging.md)。
-
-测试启动真实 Turnforge binary，固定 endpoint/model，清空子进程继承环境并绕过代理，
-只使用合成数据与临时工作区，永不传 `--allow-shell`。每次 CLI 最多 4 个模型步骤、
-每次请求 90 秒，CLI 整体等待上限 300 秒；超时后尝试 kill 并限时等待回收。
-测试还检查事件闭合、工具调用与结果配对、最后一条完整 Assistant 和 CLI 退出状态。
-这些断言不是逐字比较问候或解释文本；真实模型仍可能不遵循提示或因资源争抢超时。
-
-手工体验可在临时空工作区运行。显式指定 endpoint/model，移除云端凭据和代理，
-避免环境里的 `OPENAI_API_KEY` 回退到本地请求；命令不会修改调用者的这些环境变量：
-
-```sh
-turnforge_smoke_dir=$(mktemp -d)
-env -u TURNFORGE_API_KEY -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OLLAMA_API_KEY \
-  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-  NO_PROXY='*' no_proxy='*' \
-  cargo run --locked -- run '用一句中文问候，不调用工具。' \
-    --model turnforge-test:qwen3-4b-v1 --base-url http://127.0.0.1:11434/v1 \
-    --workspace "$turnforge_smoke_dir" --max-steps 4 --request-timeout 90 --json
-```
-
-手工命令只有逐请求超时，没有测试 helper 的 300 秒整体 deadline。
-`--json` 输出包含 prompt、模型文本、工具参数和结果；真实工作区内容仍需按敏感信息处理。
-测试失败的诊断输出只基于合成内容；不要把生产会话改成固定 fixture 提交到 Git。
+完整矩阵与各入口的断言边界已移至[测试参考：用例矩阵](testing.md#用例矩阵)。
 
 ## 6. 停止、复用与升级
 
@@ -189,28 +134,20 @@ env -u TURNFORGE_API_KEY -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OLLAMA_API_KE
   [Ollama 资源生命周期 FAQ](https://docs.ollama.com/faq)
 - **再次运行**：重新启动前台脚本即可；已经匹配 lock 的模型不需要每次 `pull/create`。
 - **升级基线**：显式选择新 runtime/tag/量化或参数；重新核验官方安装包 SHA，审查
-  Modelfile/template 与完整 digest，更新 lock 和依赖它的脚本/测试/文档，然后运行两层测试。
+  Modelfile/template 与完整 digest，更新 lock 和依赖它的脚本/测试/文档，然后执行[两层回归](testing.md)。
   不自动追踪 `latest`，不跳过 drift 检查，不以模型名字相同作为“未升级”的证据。
 
 lock 记录的是模型清单的完整 digest，不是下载页面显示的短 ID，也不是唯一权重 blob 的 hash。
 它不是包管理器，不会自动把漂移的上游 tag 恢复到旧 digest；复现依赖可用的匹配模型缓存或
 经核验的匹配来源。模型权重、个人路径、API key 和运行日志不入库。
-当前指南说明操作和测试合同；某次实测通过不等于后续所有设备、升级版本或任务都已获得兼容认证。
+当前指南说明环境操作；某次实测通过不等于后续所有设备、升级版本或任务都已获得兼容认证。
 
-## 7. 失败分类与维护
+## 7. 环境故障与基线维护
 
 | 观察到的失败 | 首先检查 | 不应采用的处理 |
 |---|---|---|
 | 连接失败、缺模型 | 前台服务是否运行、端口归属、缓存中是否存在锁定的别名 | 静默跳过、切到云端模型、终止未知监听进程 |
 | runtime / digest drift | `/api/version`、`/api/tags` 与 lock 的差异，是否发生了人为升级 | 仅为了通过测试而改 lock 或放宽断言 |
-| CLI 非零退出、协议或事件不闭合 | 用例的合成 NDJSON/stderr 诊断；对照 CLI/HTTP 确定性回归和模型设计 | 吞掉错误、仅凭部分文本判断成功 |
-| 文件内容或工具选择不符合预期 | 实际磁盘/工具结果、模型行为、prompt 与固定基线 | 更新 expected 为本次模型输出、重复运行直到出现一次成功 |
-| 超时或输出捕获失败 | 本机资源争抢、服务日志、子进程回收结果 | 无边界增加超时、并发多次重试 |
 
-测试同时排空 stdout/stderr，每路最多保留 4 MiB；超过上限会失败。失败信息最多展示每路
-已捕获内容的末尾 32 KiB，只来自合成用例；完整生产会话和个人日志不应提交到仓库。
-修复后要区分定向复验与新一轮完整回归，保留首次失败原因；新增用例需说明独立 oracle 和权限边界。
-
-已完成运行的环境、输入指纹和结果见[本地 LLM 回归记录（2026-09-12）](verification/local-llm-2026-09-12.md)。
-该记录是历史证据，不代表此后每个提交都运行过真实模型，也不把默认 CI 的 ignored 计作通过。
-包含 LLM-004 的后续执行证据见[原生调试验收记录（2026-09-14）](verification/debugging-2026-09-14.md)。
+环境已匹配但执行失败时，进入[测试失败定位](testing.md#失败定位)，不要把 Harness 或模型行为问题
+当成重新安装理由。不得仅为一次失败修改 lock、替换 expected 或自动重试到绿。
