@@ -23,6 +23,9 @@ A lightweight agent harness in Rust, built for explicit state, reliable executio
 
 ## 快速开始
 
+想直接照着案例和命令操作？先读 [Turnforge 101 用户指南](docs/101-user-guide.md)：
+从本地模型准备、单步读写文件到取消、回归和权限测试，集中在一页完成。
+
 第一次想通过调试理解 Harness，请从 [完整 step-by-step 学习教程](docs/harness-learning.md) 开始：
 [环境准备](docs/tutorial/00-setup.md) → 六个实验 → [自己写一个权限测试](docs/tutorial/07-capstone.md)。
 每章包含操作、预期现象、源码解读和自检答案；不需要先运行 CLI 才能阅读。
