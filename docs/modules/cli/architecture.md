@@ -104,5 +104,5 @@ Agent 的事件回调是同步 `FnMut`，不能在回调中 await 慢消费者�
 
 修改宿主生命周期时，同时检查 `execute` 中的 Sender 关闭、writer 返回、取消传播和 join。
 调试路径还要检查 `run_done`、输入取消、Controller Drop 及共享 fd flags 的恢复顺序。
-修改配置时同步 `--help`、README 和本模块设计表，不增加隐式凭据来源。
+修改配置时同步 `--help`、[CLI 使用参考](../../cli.md)和本模块设计表，不增加隐式凭据来源。
 行为证据与目前缺口见 [设计文档的验证部分](design.md#验证与缺口)。

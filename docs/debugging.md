@@ -1,24 +1,21 @@
-# Turnforge 分步骤调试
+# 原生 debug 使用与自动化参考
 
 状态：已实现；面向当前 macOS/Linux CLI。
 原生调试运行的是 **Turnforge 自己的 Rust 内核**，不是模拟一套模型—工具循环。
-它让你停下来检查上下文、工具参数和结果，然后推进一个语义动作。
+本页面向需要自定义 prompt/workspace 或编写外部调试驱动的使用者，维护控制输入与自动化操作方法。
+第一次跑通见 [101 用户指南](101-user-guide.md)，按章节理解实现见[学习目录](harness-learning.md)；
+固定合成场景及快捷键查 [Lab 参考](harness-lab.md)，通用参数、凭据、权限和输出查 [CLI 使用参考](cli.md)。
 架构原理见 [debugger 架构](modules/debugger/architecture.md)，精确合同见[设计](modules/debugger/design.md)。
 
 ## 1. 启动本地调试
 
-先按[本地 LLM 指南](local-llm.md)安装固定模型，并在一个终端以前台方式启动服务：
+前置：已经按[本地 LLM 指南](local-llm.md)准备固定环境，服务正在运行，当前终端已加载 Cargo。
+以下示例在仓库根目录执行；仅为本次子进程清除云凭据与代理，以新临时目录调试自定义写入任务，不授权 shell：
 
 ```sh
-./scripts/serve-local-llm.sh
-```
-
-另开终端进入仓库。清除云模型 key，以临时目录做练习，不授权 shell：
-
-```sh
-source "$HOME/.cargo/env"
 turnforge_debug_workspace="$(mktemp -d "${TMPDIR:-/tmp}/turnforge-debug.XXXXXX")"
-env -u TURNFORGE_API_KEY -u OPENAI_API_KEY \
+env -u TURNFORGE_API_KEY -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OLLAMA_API_KEY \
+  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
   NO_PROXY='*' no_proxy='*' \
   cargo run --locked -- debug 'Write result.txt containing exactly hello, then report completion.' \
   --workspace "$turnforge_debug_workspace" --allow-write \
@@ -28,6 +25,8 @@ env -u TURNFORGE_API_KEY -u OPENAI_API_KEY \
 没有 `--allow-write` 时，写工具不会展示且运行时仍会拒绝；调试本身不赋予工具权限。
 CLI 接收的 prompt 必须在参数里，`debug -` 不读取 prompt，因为 stdin 专门用于控制命令。
 不要让另一个程序同时读取这个 stdin。普通 `run -` 行为不变。
+本例临时目录由你的 shell 创建，原生 debug 不像 Lab 那样自动清理；退出后可检查文件，再自行清理该具体目录。
+`--request-timeout` 是逐请求限制，不包含人工暂停时间，也不是进程整体 deadline。
 
 ## 2. 跟着暂停点操作
 
@@ -78,31 +77,9 @@ JSON 命令拒绝未知字段。自动化应做到：
 
 ## 4. 测试分层
 
-默认回归不依赖真实模型，适合维护状态机和 CLI 协议；真实本地模型用于验证实际 provider/工具闭环。
-
-```sh
-cargo test --locked --all-targets
-cargo test --locked --release --all-targets
-```
-
-仅运行确定性调试专项（不需要启动 Ollama）：
-
-```sh
-cargo test --locked --test debugging
-cargo test --locked --test cli_http debug_cli_
-```
-
-服务及固定模型准备好后，显式运行真实模型调试用例。与其它真实模型测试串行执行，不争抢单模型服务：
-
-```sh
-cargo test --locked --test local_llm local_llm_debug_steps_through_read_and_final_answer -- --ignored --test-threads=1 --nocapture
-```
-
-该用例只读临时目录中的随机 marker，自动消费真实 CLI 的暂停事件并发送 Step，检查工具预览、
-读取结果快照、最终答案和最终结束确认。它不需要 `--allow-write` 或 `--allow-shell`。
-用例矩阵见[本地 LLM 指南](local-llm.md#用例矩阵)；库/CLI 的精确测试映射见[debugger 设计](modules/debugger/design.md#测试与变更检查)。
-确定性测试还独立计数模型/工具调用并检查实际磁盘，不能只把 stdout 中的“暂停”当作副作用隔离证明。
-实际测试记录属于某个版本与环境的证据，不代表所有模型都稳定选择同一工具顺序。
+完整门禁、真实模型执行与诊断统一由[测试参考](testing.md)维护；定向命令见[调试专项](testing.md#调试专项)。
+库/CLI 的合同—测试映射见[debugger 设计](modules/debugger/design.md#测试与变更检查)。
+本页不把手工暂停现象当作副作用隔离证明，也不维护另一份回归清单。
 
 ## 5. 安全、故障与范围
 
