@@ -89,6 +89,12 @@ struct RunArgs {
     base_url: String,
     #[arg(long, default_value = "20")]
     max_steps: NonZeroU32,
+    /// Stop before executing this many consecutive identical tool batches.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..))]
+    tool_repeat_limit: Option<u32>,
+    /// Retry HTTP 429/502/503/504 before streaming (0-3; default: disabled).
+    #[arg(long, default_value = "0", value_parser = clap::value_parser!(u8).range(0..=3))]
+    http_retries: u8,
     /// Total timeout for each HTTP model request, including streaming (seconds).
     #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..=3600))]
     request_timeout: u64,
@@ -165,6 +171,8 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
                 model: scenario.model.clone(),
                 base_url: scenario.base_url.clone(),
                 max_steps: NonZeroU32::new(4).unwrap(),
+                tool_repeat_limit: None,
+                http_retries: 0,
                 request_timeout: 90,
                 json: false,
             };
@@ -228,9 +236,11 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
             &args.model,
             Duration::from_secs(args.request_timeout),
         )?
-    };
+    }
+    .with_http_retries(args.http_retries)?;
     let mut config = AgentConfig {
         max_steps: args.max_steps,
+        tool_repeat_limit: args.tool_repeat_limit.and_then(NonZeroU32::new),
         ..AgentConfig::default()
     };
     config.system.push_str(&format!("\nWorkspace root: {}. File tool paths must be workspace-relative. Only tools granted by the host are available.", workspace.root().display()));
@@ -420,4 +430,63 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
         RunOutcome::Cancelled => 130,
         RunOutcome::Failed => 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reliability_options_are_opt_in_and_shared_by_run_and_debug() {
+        for mode in ["run", "debug"] {
+            let cli =
+                Cli::try_parse_from(["turnforge", mode, "task", "--model", "fixture"]).unwrap();
+            let (Command::Run(args) | Command::Debug(args)) = cli.command else {
+                panic!("unexpected command");
+            };
+            assert_eq!(args.http_retries, 0);
+            assert_eq!(args.tool_repeat_limit, None);
+
+            let cli = Cli::try_parse_from([
+                "turnforge",
+                mode,
+                "task",
+                "--model",
+                "fixture",
+                "--http-retries",
+                "3",
+                "--tool-repeat-limit",
+                "2",
+            ])
+            .unwrap();
+            let (Command::Run(args) | Command::Debug(args)) = cli.command else {
+                panic!("unexpected command");
+            };
+            assert_eq!(args.http_retries, 3);
+            assert_eq!(args.tool_repeat_limit, Some(2));
+        }
+    }
+
+    #[test]
+    fn reliability_options_reject_invalid_budgets_before_execution() {
+        for (flag, value) in [
+            ("--http-retries", "4"),
+            ("--http-retries", "-1"),
+            ("--tool-repeat-limit", "0"),
+            ("--tool-repeat-limit", "1"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "turnforge",
+                    "run",
+                    "task",
+                    "--model",
+                    "fixture",
+                    flag,
+                    value,
+                ])
+                .is_err()
+            );
+        }
+    }
 }

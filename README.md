@@ -13,6 +13,7 @@ A lightweight agent harness in Rust, built for explicit state, reliable executio
 - 类型化会话、模型—工具循环、流式回复和 NDJSON 事件接口。
 - OpenAI-compatible Chat Completions；文件读写、目录操作与 shell 工具。
 - 默认只读，文件写入和 shell 分别授权；超时、协作取消、输出限额和背压处理。
+- 可选的重复工具批次防护，以及仅在流开始前针对指定 HTTP 状态的有限重试。
 - 原生语义单步调试、固定本地模型的 Harness Lab，以及联系源码的六阶段学习课程。
 - 不依赖真实模型的确定性测试，以及显式启用的本地 Ollama 回归。
 
@@ -38,7 +39,7 @@ A lightweight agent harness in Rust, built for explicit state, reliable executio
 [文件工具设计](docs/modules/filesystem-tools/design.md)、[Shell 设计](docs/modules/shell-tool/design.md)和
 [输出设计](docs/modules/event-output/design.md)维护。
 
-当前没有持久化/恢复、自动重试、上下文压缩、交互审批、skills/AGENTS 自动加载、MCP、
+当前没有持久化/恢复、流中断重试、上下文压缩、交互审批、skills/AGENTS 自动加载、MCP、
 Anthropic、OpenAI Responses API、图片/推理块、TUI、subagent 或 OS sandbox。
 
 ## 开发与维护

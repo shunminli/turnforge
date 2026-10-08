@@ -27,10 +27,25 @@ pub trait Model: Send + Sync {
 
 - URL 接受 HTTPS，或主机为 `localhost` / loopback IP 的 HTTP；拒绝 URL 用户名、密码、query、fragment。
 - `base_url` 应含 API 前缀，如 `/v1`；去掉 path 尾部 `/` 后追加 `/chat/completions`。
-- model 经 trim 判空，但存储原字符串；timeout 必须非零。Client 连接超时固定 10 秒，整体请求超时取传入值并覆盖流读取。
+- model 经 trim 判空，但存储原字符串；timeout 必须非零。Client 连接超时固定 10 秒，
+  每次 HTTP attempt 的整体请求超时取传入值并覆盖流读取；不是全部尝试与退避等待的总 deadline。
 - `None` 或空 API key 不发送授权头；否则使用 `Bearer`，非法 header 值报配置错误，header 标为 sensitive。
 - 禁用 HTTP 重定向；provider 不实现 `Debug`。非 2xx 响应只暴露状态码，不输出 body；reqwest 错误移除 URL。
+- ClientBuilder 显式使用 `reqwest::retry::never()`，禁用依赖内建的协议重试；
+  即使下游合并启用 reqwest 的 HTTP/2 特性，也只允许下述由本模块计数的状态重试。
 - 环境变量读取归 CLI：优先非空 `TURNFORGE_API_KEY`，再取非空 `OPENAI_API_KEY`；库不自行读取环境。
+
+`OpenAiModel::with_http_retries(self, max_retries: u8) -> Result<Self, ModelError>`
+消费模型对象并返回已配置对象；`0..=3` 有效，超出范围返回 `Configuration`。
+默认值为 0。CLI 的 `--http-retries` 是实际消费者，Lab 保持构造默认值。
+
+收到 HTTP 429/502/503/504 且预算未耗尽时，丢弃响应并按 100/200/400 ms 等待后重发原 JSON。
+最多是一次初始请求加三次重试；不读取失败响应正文，也不采用 Retry-After。
+其它 HTTP 状态直接失败；`.send()` 的 transport/timeout 错误、成功 HTTP 的 Content-Type 错误和所有
+SSE/JSON/组装错误均不重试。收到失败状态只是本地重放政策的依据，不证明远端没有处理请求。
+重试发生在 SSE 解析前，因此没有重试前的 delta、Assistant 提交或工具执行需要撤销。
+重试计数归单次模型 future，不修改 Agent step；只有最终成功响应的 usage 进入 AssistantMessage。
+`complete` 的优先 cancel-select 同时覆盖 HTTP 与等待；没有独立任务、长期 token 字段或重试 channel。
 
 本地专用 `OpenAiModel::new_local(base_url, model, timeout)` 同样返回 `Result<Self, ModelError>`：
 
@@ -45,7 +60,8 @@ pub trait Model: Send + Sync {
 
 ## 3. 请求序列化
 
-每次发送一次 POST JSON；始终设置 `model`、`stream: true`、`stream_options.include_usage: true`。
+每次模型调用先构造同一份 POST JSON，默认发送一次；启用 HTTP 重试时按上述政策重发。
+始终设置 `model`、`stream: true`、`stream_options.include_usage: true`。
 
 | 内部输入 | Chat Completions 请求内容 |
 |---|---|
@@ -88,9 +104,9 @@ provider 不检查工具是否注册、权限是否允许或输入是否符合�
 
 | `ModelError` | 当前来源及边界 |
 |---|---|
-| `Configuration(String)` | URL、空 model/零 timeout、授权 header 校验失败；错误不回显原配置值 |
-| `Transport(String)` | Client 构造或 `.send()` 失败；请求 URL 已移除，包括该阶段的 timeout |
-| `HttpStatus(u16)` | 非 2xx；不读入诊断正文，无本模块自动重试 |
+| `Configuration(String)` | URL、空 model/零 timeout、授权 header 或 retry limit 校验失败；错误不回显原配置值 |
+| `Transport(String)` | Client 构造或 `.send()` 失败；请求 URL 已移除，包括该阶段的 timeout；不重试 |
+| `HttpStatus(u16)` | 非 2xx；限定状态可按显式预算重试，预算耗尽或其它状态返回本错误；不读入诊断正文 |
 | `Protocol(String)` | Content-Type、SSE/JSON/组装校验失败；正文读取中断、读取超时和 2 MiB 限制也在 SSE 层统一映射为此类 |
 | `Cancelled` | `complete` 的优先取消分支；不是远端服务确认取消 |
 
@@ -101,13 +117,18 @@ Agent 把 `Cancelled` 转为取消 outcome，其余错误转为失败；模型�
 
 ## 6. 测试映射与证据边界
 
-以下函数位于 [cli_http.rs](../../../tests/cli_http.rs)，使用真实本地 TCP 和 CLI，不需要模型密钥。
+以下函数位于 [cli_http.rs](../../../tests/cli_http.rs)，使用真实本地 TCP；
+多数通过 CLI，取消与 transport 用例直接调用生产适配器。不需要模型密钥。
 
 | 用例 | 保护的合同 |
 |---|---|
 | `fragmented_tool_arguments_round_trip_to_real_file_and_model` | 分段 SSE/UTF-8、参数组装、usage、真实写文件及下一请求的工具回填 |
-| `malformed_or_incomplete_streams_never_execute_tools` | 非 JSON、无 DONE、length、坏参数、无 finish、error event 不触发工具 |
-| `http_error_body_is_not_leaked_or_retried` | HTTP 429 正文不泄露，本次失败无第二次请求 |
+| `malformed_or_incomplete_streams_never_execute_tools` | 启用重试仍不重发非 JSON、无 DONE、length、坏参数、无 finish 或 error event；不触发工具 |
+| `http_error_body_is_not_leaked_or_retried` | 默认 HTTP 429 正文不泄露，本次失败无第二次请求 |
+| `opted_in_http_retries_replay_only_rejected_statuses_with_the_same_request` | 429/502/503/504 后恢复，原请求一致，仍只有一个 Agent step/Assistant；其它状态立即失败 |
+| `opted_in_http_retry_budget_stops_after_the_initial_request_and_three_retries` | 最多四次请求，耗尽返回最终 HTTP 状态，无 Assistant 或正文泄露 |
+| `http_retry_backoff_is_cancellable_without_a_followup_request` | 实际 HTTP 503 后取消，退避结束后没有额外请求或 delta |
+| `opted_in_http_retries_do_not_replay_transport_failures` | 服务器读入 POST 后无响应断开，未知处理结果不重发 |
 | `model_endpoint_configuration_rejects_plaintext_remote_and_url_secrets` | 远程明文/URL 秘密/非法 header 拒绝，loopback HTTP 可用 |
 | `blocked_stdout_does_not_block_ctrl_c_or_process_exit` | 流式输出背压时整条宿主链路仍可取消，不证明远端停止 |
 
@@ -119,11 +140,14 @@ Agent 把 `Cancelled` 转为取消 outcome，其余错误转为失败；模型�
 通过真实 CLI/local provider 检查固定本地配置和无 Authorization 的模型请求；Lab 上层 origin 边界另由
 `lab.rs::tests::lab_origin_requires_literal_loopback_and_no_extra_url_components` 检查。
 目前没有直接覆盖 `OpenAiModel::new_local` 全部非法输入的独立矩阵；Lab 入口拒绝不等于证明所有库调用者。
+当前依赖特性没有 HTTP/2/HTTP/3，尚无下游特性合并后的 HTTP/2 NACK 故障注入回归；
+禁用依赖重试的结论来自共享构造的显式 policy 与锁定依赖源码，不冒充该链路已动态验收。
 以上测试也不证明任意代理环境或所有网络故障组合。
 
 ## 7. 已知缺口与维护清单
 
-当前未接入 Responses/Anthropic、多模态、reasoning、重试/退避、缓存、token 预算或 provider 流式恢复。
+当前未接入 Responses/Anthropic、多模态、reasoning、流中重试、Retry-After、jitter、
+跨尝试总 deadline、缓存、token 预算或 provider 流式恢复。
 本地协议用例不等于真实服务兼容认证；Content-Type、2 MiB、choice/refusal、finish 后数据、
 id/name 改变、usage 异常和实际 HTTP 读取取消等分支尚无逐项专门回归用例。
 

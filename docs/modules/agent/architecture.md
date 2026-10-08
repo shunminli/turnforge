@@ -16,11 +16,12 @@
 |---|---|---|
 | `model: M` | Agent 持有实现 `Model` 的具体类型 | 推理与暂态流式输出 |
 | `tools: ToolRegistry` | Agent 持有已配置的 registry | 查找/授权并调用可信工具 |
-| `config: AgentConfig` | Agent 持有 | system prompt 与非零步数上限 |
+| `config: AgentConfig` | Agent 持有 | system prompt、非零步数上限及可选工具批次重复上限 |
 | `messages: Vec<Message>` | Agent 独占可变 | 跨 user turn 的内存历史 |
 | `state: RunState` | Agent 独占可变 | 可读取的阶段与结束结果 |
 | token / event callback | run 调用期间借用 | 宿主请求取消、消费通知 |
 | 可选 `DebugSession` | `run_debug` 消费，run 期间持有 | 有界控制接收端、单步模式与暂停序号；不持有 Agent |
+| 上一工具批次与连续重复次数 | `run_loop` 的私有局部值 | 开启重复保护时保存上批值；本 run 返回/drop 时释放，不跨 user turn 累积 |
 
 [CLI](../cli/architecture.md) 是实际宿主；未来其它宿主也应调用相同库 API。
 `ModelRequest` 临时借用 system、messages 和可见工具定义，provider 不能获得会话的可变引用。
@@ -50,7 +51,9 @@ CLI 发 token 后继续等待 run；Agent 不以一个统一超时直接中断�
 
 `run_debug` 与 `run` 共享执行循环，前者在安全边界协作等待控制，后者保持自动运行。
 Agent 设置 `Paused` 并通过事件发送 owned 快照；仍持有同一 `&mut self`，不会把历史修改权交给 Controller。
-首次模型请求前、完整 Assistant 提交后、每条 Tool 结果提交后均可暂停；模型/工具执行中不强行暂停 future。
+首次模型请求前、完整 Assistant 提交后、正常批次的每条 Tool 结果提交后均可暂停；模型/工具执行中不强行暂停 future。
+重复保护命中的批次在 AfterModel 预告 Finish(Failed)，释放这一动作后整批补错误结果再终止，
+没有工具执行或虚构的 AfterTool 暂停。
 工具结果后的边界意味着工具已返回且其清理 owner 完成正常清理路径，不是仅仅收到一个 stdout 标记。
 
 控制 channel、pause ID、防旧命令重放和快照字段属于[调试模块](../debugger/design.md)。
@@ -63,6 +66,8 @@ Agent 仍负责所有调用结果配对；暂停处取消同样沿原工具补�
 - **完整消息再提交**：模型流式失败不会在 transcript 中留下可执行的半条助手消息。
 - **错误工具结果可继续推理**：工具失败反馈给模型；模型/协议失败则终止本次 run。
 - **取消不回滚**：历史记录已发生的事实，对未执行调用补结果，不假装修改消失。
+- **可选重复保护**：比较连续模型轮次给出的整个有序工具批次，忽略调用 ID，以参数 JSON 值判等；
+  触发时先闭合该批结果再失败，不调用其中的工具。它是减少重复操作的启发式限制，不判断任务是否已有进展。
 
 ## 故障责任与限制
 
@@ -73,6 +78,8 @@ Agent 仍负责所有调用结果配对；暂停处取消同样沿原工具补�
 意外 drop 或 callback panic 可使 run 停在 Running 或 Paused；后续调用明确拒绝恢复不确定状态。
 这不是完整的 crash recovery：已发生的外部副作用仍存在，历史也没有持久化。
 会话长期增长没有 token/内存总预算；max_steps 只限制本次 run 的模型请求次数。
+`tool_repeat_limit` 默认关闭；启用时额外保留至多上一批 32 个调用的值副本。
+检测不把同一模型轮次中的多个相同调用计为多次重复，也不检测任意长的周期或工具成功/失败率。
 调试快照额外复制历史；这是观察成本，不是持久化或固定内存预算。
 
 ## 维护影响

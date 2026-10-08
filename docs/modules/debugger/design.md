@@ -63,7 +63,7 @@ reason 是诊断 String，不是新的封闭错误 enum；拒绝后继续等待�
 | `DebugPoint` | 当时已提交的事实 | 可能的 `DebugAction` |
 |---|---|---|
 | `BeforeModel` | 首次 User 已提交，尚无模型请求 | `Model { step: 1 }` |
-| `AfterModel` | 完整且通过校验的 Assistant | 首个 `Tool { index, call }` 或 `Finish { outcome: Completed }` |
+| `AfterModel` | 完整且通过校验的 Assistant | 首个 Tool、Finish(Completed)，或重复保护触发时 Finish(Failed) |
 | `AfterTool { index, call_id }` | 指定工具的真实结果；index 为当前批次从 0 开始 | 下一 Tool、下一 Model 或 `Finish { outcome: StepLimit }` |
 
 初始安全点在第一次模型请求之前；模型和工具动作之后到下一安全点。
@@ -72,6 +72,10 @@ reason 是诊断 String，不是新的封闭错误 enum；拒绝后继续等待�
 工具批次依次处理，不因为一次模型返回多个调用就把整批当作一次调试动作。
 最后的无工具回答也先停在 AfterModel；还需 Step 或 Continue 才从可观察现场进入 Completed。
 达到 max_steps 时仍闭合该批全部结果，然后暂停在 Finish(StepLimit) 之前，不额外请求总结。
+重复保护命中时，AfterModel 的 next 为 Finish(Failed)，pending_calls 仍含完整已提交批次。
+释放这一个 Finish 动作后，Agent 逐条提交未执行的 tool_loop 结果再返回失败；
+没有 ToolStarted 或 AfterTool 暂停，每条结果仍 yield。保护与 max_steps 同时达到时，以保护失败结束。
+精确检测规则、配置和错误归属见 [Agent 设计](../agent/design.md#可选工具批次重复保护)。
 
 ## 快照 v1
 
@@ -125,6 +129,8 @@ Rust Event 中两种 snapshot 载荷是 `Box<DebugSnapshot>`，JSON 仍是直接
 - AfterTool 暂停时取消，已完成结果和外部副作用保留，只补剩余调用。
 - 取消不再等待人工确认 Finish；完整协作路径写 Finished(Cancelled)，发一个 RunFinished。
 - 非法模型响应沿原 Failed 路径结束；不会为无效 Assistant 暴露可执行的 AfterModel 暂停。
+- 重复保护 Finish(Failed) 暂停处或闭合结果中取消，保留已有 tool_loop，剩余调用补 cancelled，
+  最终返回 Cancelled；若在最后结果提交后取消，同样优先取消。
 - 丢弃 Running 或 Paused 的 run future，后续 run/run_debug 返回 Interrupted；无恢复接口。
 
 HTTP/shell 超时适用于已开始的操作；人工暂停本身没有自动超时。
@@ -147,6 +153,10 @@ HTTP/shell 超时适用于已开始的操作；人工暂停本身没有自动超
 | 丢弃暂停 future 后不可恢复 | `dropping_a_paused_future_does_not_allow_ambiguous_resume` |
 | Step 不放宽权限或步数上限 | `stepping_never_grants_permission_or_bypasses_the_step_limit` |
 | 全部命令 JSON round-trip、未知字段/缺失或非法 ID 拒绝 | `debug_commands_have_strict_json_fields_and_required_pause_ids` |
+
+[Agent 测试](../../../tests/agent.rs) 的 `tool_repeat_guard_debug_finish_closes_the_batch_without_tool_actions`
+覆盖保护命中时完整 pending_calls、Finish(Failed) 预览及一次释放后闭合整批，没有伪工具动作；
+`cancellation_overrides_a_tripped_tool_repeat_guard_before_and_during_closure` 覆盖暂停、部分及全部结果提交后取消优先。
 
 真实 binary/HTTP/文件与信号证据在 [tests/cli_http.rs](../../../tests/cli_http.rs)：
 

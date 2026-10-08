@@ -76,6 +76,8 @@ Message / Event 为这些边界提供共同数据类型；不是独立执行服�
 ## 能力边界与演进
 
 当前支持 Chat Completions 的文本/function tools 子集、基础文件/shell 工具、单进程内存会话和原生语义调试。
+可选的重复有序工具批次防护由 Agent 持有，指定 HTTP 状态的流前有限重试由 OpenAiModel 持有；
+两者缺省关闭，不改变串行工具、消息提交、协作取消与 Lab 验收边界。
 本地 Lab 提供有限合成场景验收及六课学习提示，不是完整 benchmark、学习认证或新 UI runtime。
 没有持久化恢复、上下文压缩、交互审批、skills/AGENTS 自动加载、Anthropic、Responses API、TUI 或 OS sandbox。
 `--allow-shell` 不是工作区沙箱，也不受 `--allow-write` 限制；静态路径检查不是抗恶意并发变更的安全隔离。

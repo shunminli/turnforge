@@ -66,6 +66,7 @@ index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，�
 2. 只有完整且通过校验的 Assistant 进入历史，ModelDelta 不能直接作为调用执行。
 3. 正常协作退出时，每个已提交工具调用都有对应 `Message::Tool`；未知、拒绝和取消也是结果。
 4. `ToolStarted` 在 registry 执行检查之前发出。已取消而跳过的待执行调用只有结果，没有 ToolStarted。
+   可选重复批次防护拦截的整批同样不发 ToolStarted，提交 `tool_loop` 错误后以 Failed 结束。
 5. run 的 future 被完整等待且 callback 不 panic 时，已接受的 run 发一个 RunFinished。
    丢弃 future、panic、输出故障或宿主强杀不受“消费者收到一次 terminal”的保证保护。
 

@@ -21,8 +21,10 @@
 | workspace | `--workspace` > `.` | `Workspace::new` 规范化并验证目录 |
 | 写授权 | `--allow-write`；缺省 false | 仅文件写能力 |
 | shell 授权 | `--allow-shell`；缺省 false | 宿主权限的非沙箱 shell |
-| max steps | `--max-steps` > 20 | `NonZeroU32`；模型请求次数上限 |
-| 请求超时 | `--request-timeout` > 120 秒 | 整数 1–3600；每次 HTTP 请求含流读取 |
+| max steps | `--max-steps` > 20 | `NonZeroU32`；模型步骤上限，不计同一步内 HTTP 重试 |
+| 重复工具防护 | `--tool-repeat-limit N`；缺省关闭 | 整数 2–4294967295；连续相同有序工具批次的阈值，忽略 call ID |
+| HTTP 重试 | `--http-retries N` > 0 | 整数 0–3；每模型步骤至多 1+N 次 HTTP 尝试，仅 429/502/503/504；无环境绑定 |
+| 请求超时 | `--request-timeout` > 120 秒 | 整数 1–3600；每次 HTTP 尝试含流读取，不是全部尝试与退避的总 deadline |
 | 工具超时 | `--tool-timeout` > 30 秒 | 整数 1–3600；只配置 shell，含排空 |
 | 输出模式 | `--json`；缺省 false | NDJSON 或文本增量 |
 
@@ -43,6 +45,7 @@ debug 在建立 registry 前拒绝 prompt `-`；配置 provider/Agent 后建立 
 
 Lab 先 `lab::prepare` 完成本机预检和场景，再构造固定 RunArgs：max_steps 4、每模型请求 90 秒、
 临时 workspace、仅 write 场景文件写授权、始终无 shell、无 key，provider 使用 `OpenAiModel::new_local`。
+Lab 固定禁用重复批次防护和 HTTP 重试，不把随机失败重试到 PASS。
 HostMode::Lab 持有 PreparedLab、automatic 和 lesson；自动模式不创建 DebugInput。
 `learn` 不创建 registry、provider 或 Agent，只把 catalog 放入容量 1 的 OutputItem channel，经 forward 写出并返回。
 模型预检与 learn 输出位于 run/signal 组合之前；不要将运行期 Ctrl-C 清理保证外推到这些前置路径。
@@ -135,6 +138,11 @@ stdout 故障时终态可能截断；下游必须同时检查进程退出码与�
 取消不是回滚，正常结束或错误返回都不撤销已经发生的文件/命令副作用。
 
 ## 验证与缺口
+
+`--tool-repeat-limit` 在达到阈值的整批执行前关闭所有已提交调用（`tool_loop`），
+没有该批的 ToolStarted；AgentError 导致 Failed/退出 1。不是“任务无进展”的通用判定，也不撤销此前副作用。
+`--http-retries` 仅重放收到的指定非 2xx 状态，不重试 transport、成功响应的协议错误或流中断；
+100/200/400ms 退避可取消。隐含费用和提供方处理不可保证 exactly-once。详见 [Model 设计](../model/design.md)。
 
 主要证据：[tests/cli_http.rs](../../../tests/cli_http.rs) 的真实 TCP → CLI → 文件/进程链路。
 `fragmented_tool_arguments_round_trip_to_real_file_and_model` 覆盖模型参数、JSON 事件和工具结果回传。

@@ -13,19 +13,20 @@
 
 - 定义 `ModelRequest`、`ModelDelta`、`ModelError` 和 `Model::complete`。
 - 把内部消息和工具定义转换为 HTTP 请求，处理模型认证和请求超时。
+- 执行宿主显式启用的有限 HTTP 状态重试，保留同一请求体。
 - 解析流式响应、发出暂态增量、组装并校验完整 `AssistantMessage`。
 - 在请求结束、错误或取消时释放当前请求资源，不启动工具。
 
-明确不负责：会话提交、工具权限和执行、运行步数、持久化、UI、审批以及重试策略。
+明确不负责：会话提交、工具权限和执行、运行步数、持久化、UI、审批以及通用恢复策略。
 这些边界分别属于 [Agent](../agent/architecture.md)、工具层和宿主，而不是 provider。
 
 ## 2. 依赖与调用链
 
 ```text
-CLI 宿主构造 OpenAiModel（endpoint / key / model / timeout）
+CLI 宿主构造 OpenAiModel（endpoint / key / model / timeout / HTTP retries）
   → Agent<M> 持有 M
       → complete(ModelRequest 借用, cancel 借用, delta callback 借用)
-          → request: 内部消息 → Chat Completions JSON → reqwest
+          → request: 内部消息 → Chat Completions JSON → reqwest / 有界状态重试
           → eventsource-stream → Assembly.push → ModelDelta → 宿主
           → [DONE] → Assembly.finish → AssistantMessage
       → Agent 再校验 → 提交消息 → 决定是否执行工具
@@ -46,11 +47,11 @@ Ollama 版本/digest 检查不属于通用 provider，仍由 Lab 预检负责。
 
 | 对象 | owner / 借用关系 | 生命周期与可变状态 |
 |---|---|---|
-| `OpenAiModel` | CLI 构造后 move 给 `Agent<M>` | 与 Agent 同寿命；持有 HTTP Client、endpoint 和 model ID |
+| `OpenAiModel` | CLI 构造后 move 给 `Agent<M>` | 与 Agent 同寿命；持有 HTTP Client、endpoint、model ID 和不变的 retry limit |
 | `ModelRequest<'a>` | 按值传入，字段只读借用 system/messages/tools | 只在一次调用期间使用，不保存会话引用 |
 | `CancellationToken` | 宿主持有，provider 借用 | 通知当前请求取消，不存进长期 provider |
 | `emit` | 调用方提供，provider 临时独占可变借用 | 同步回调，调用方必须保证不阻塞、不 panic |
-| 请求 JSON / Response / SSE stream | `request` future | 仅当前请求持有；future 完成或 drop 时释放 |
+| 请求 JSON / Response / SSE stream / 重试计数与等待 | `request` future | JSON 在多个 HTTP attempt 间复用；每个 Response 独占；future 完成或 drop 时释放 |
 | `Assembly` | `request` future 独占 | 文本、工具片段、usage 和 finish reason 的唯一写入者 |
 | `AssistantMessage` | `Assembly::finish` 返回 owned value | 交给 Agent；provider 不再持有或改写它 |
 
@@ -75,6 +76,7 @@ Ollama 版本/digest 检查不属于通用 provider，仍由 Lab 预检负责。
 
 `OpenAiModel::complete` 通过优先检查取消的 `tokio::select!` 竞争当前请求。
 取消获胜时返回 `ModelError::Cancelled`，丢弃本地 HTTP future；本模块没有自建后台任务。
+同一 select 覆盖每次 HTTP attempt 和退避等待；取消后没有另一个任务继续重试。
 每处理一个普通 JSON SSE event 会 `yield_now()`，让宿主有机会排空输出和发出取消。
 这不保证同步 callback 的取消时延，因此 callback 不得执行阻塞 I/O。
 
@@ -87,17 +89,22 @@ Agent 也在模型阶段竞争取消，故所有 `Model` 实现都必须允许 f
 - 直接维护小型 HTTP/SSE 适配器：支持自选兼容 endpoint，也必须自行维护协议校验。
 - 通用消息保持纯文本/function tools：减少 M0 面积，但不能无损承载多模态、reasoning 或签名块。
 - 工具按 SSE index 排序组装：恢复稳定的调用顺序，不把网络分片顺序变成执行顺序。
-- 不自动重试：错误返回真实失败，避免隐式重复请求、成本和暂态事件混淆。
+- 默认一次请求；宿主可显式启用最多三次 HTTP 状态重试。只有收到限定失败状态才重发，
+  未知处理结果的 transport failure 和任何成功响应后的协议/SSE 失败直接返回错误。
+- 共享客户端构造显式关闭 reqwest 内建重试，避免下游依赖特性合并启用 HTTP/2 后产生
+  不归 `request` future 的状态重试循环计数的额外请求；本地与通用模型共用这一构造。
 - 不暴露任意 JSON 参数透传：新配置应先说明真实消费者和兼容性，再增加显式字段。
 
 增加 Anthropic 或 Responses 适配器时，先确认现有 `AssistantMessage` 是否能表达其信息，
 不能把不可表示的信息悄悄丢掉后宣称兼容。模型名称并不自动选择协议。
-增加重试、usage 汇总或上下文裁剪时，应先确定 owner 和跨尝试的事件/费用合同。
+重试发生在任何 delta 发出之前，不需要暂态内容回退；usage 仅来自最终成功响应，
+HTTP attempt 不增加 Agent step。超时约束每个 attempt，不是所有尝试与退避的总 deadline。
+增加流中重试、usage 汇总或上下文裁剪时，应先确定 owner 和跨尝试的事件/费用合同。
 provider 的请求转换可以变化，但不能越过 Agent 的消息提交边界或自行执行工具。
 
 ## 7. 维护入口
 
-先读 [Model contract](../../../src/model.rs)，再读 `OpenAiModel::new/new_local/request` 和 `Assembly`。
+先读 [Model contract](../../../src/model.rs)，再读 `OpenAiModel::new/new_local/with_http_retries/request` 和 `Assembly`。
 主要跨边界证据是 [cli_http.rs](../../../tests/cli_http.rs)：真实 TCP → CLI → 文件 → 下一次请求。
 Agent 对模型失败和取消的处理由 [agent.rs 测试](../../../tests/agent.rs)补充。
 具体用例映射、尚未覆盖的协议分支与修改清单见[设计文档](design.md)。
