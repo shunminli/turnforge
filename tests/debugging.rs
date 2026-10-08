@@ -103,6 +103,7 @@ fn agent(
         AgentConfig {
             system: "fixed system".into(),
             max_steps: NonZeroU32::new(max_steps).unwrap(),
+            tool_repeat_limit: None,
         },
     )
 }

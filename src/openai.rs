@@ -28,6 +28,7 @@ pub struct OpenAiModel {
     client: Client,
     endpoint: Url,
     model: String,
+    http_retries: u8,
 }
 
 impl OpenAiModel {
@@ -67,6 +68,19 @@ impl OpenAiModel {
             return Err(config("local models require a literal loopback IP URL"));
         }
         Self::build(base_url, None, model, timeout, Client::builder().no_proxy())
+    }
+
+    /// Retry only received HTTP 429/502/503/504 responses, before any SSE is
+    /// consumed. `0..=3` retries follow 100/200/400 ms waits; the default is 0.
+    /// The request timeout applies to each attempt, not the combined duration.
+    /// Transport and protocol errors never retry, and cancellation drops the
+    /// current HTTP request or wait without leaving a background task.
+    pub fn with_http_retries(mut self, max_retries: u8) -> Result<Self, ModelError> {
+        if max_retries > 3 {
+            return Err(config("HTTP retries must be between 0 and 3"));
+        }
+        self.http_retries = max_retries;
+        Ok(self)
     }
 
     fn build(
@@ -109,6 +123,9 @@ impl OpenAiModel {
         let client = builder
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
+            // Keep every retry in request(), even if a downstream crate enables
+            // reqwest's HTTP/2 feature and its default protocol-NACK retries.
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
             .build()
@@ -117,6 +134,7 @@ impl OpenAiModel {
             client,
             endpoint,
             model: model.into(),
+            http_retries: 0,
         })
     }
 
@@ -147,17 +165,29 @@ impl OpenAiModel {
                 "type":"function", "function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
             })).collect());
         }
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .json(&body)
-            .send()
-            .await
-            .map_err(transport)?;
-        if !response.status().is_success() {
-            // Do not echo response bodies: gateways can include prompts or keys.
-            return Err(ModelError::HttpStatus(response.status().as_u16()));
-        }
+        let mut retries = 0;
+        let response = loop {
+            let response = self
+                .client
+                .post(self.endpoint.clone())
+                .json(&body)
+                .send()
+                .await
+                .map_err(transport)?;
+            let status = response.status();
+            if status.is_success() {
+                break response;
+            }
+            if retries == self.http_retries || !matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+                // Do not echo response bodies: gateways can include prompts or keys.
+                return Err(ModelError::HttpStatus(status.as_u16()));
+            }
+            // Release the rejected response before waiting. The complete()
+            // future owns this loop, so its cancel-select also drops this wait.
+            drop(response);
+            tokio::time::sleep(Duration::from_millis(100 << retries)).await;
+            retries += 1;
+        };
         let content_type = response
             .headers()
             .get("content-type")

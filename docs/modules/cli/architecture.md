@@ -13,6 +13,8 @@ CLI 是 headless 库的第一个真实消费者，每个 `run`、`debug` 或 `la
 编译入口明确限定 Unix，支持目标是 macOS/Linux；不是跨平台终端抽象。
 Lab 的基线/临时场景/oracle 属于[Lab 模块](../harness-lab/architecture.md)，课程属于[学习模块](../learning/architecture.md)。
 CLI 只把它们组合到原有调度和输出生命周期；`learn` 不创建模型或 Agent。
+可选重复工具阈值移入 AgentConfig，由 Agent 决策；HTTP 重试设置移入 OpenAiModel，
+由单次模型调用 future 执行。宿主不持有检测历史、不额外 spawn 重试 worker，Lab 两项固定关闭。
 
 ## 组件关系
 

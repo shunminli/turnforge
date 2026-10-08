@@ -15,7 +15,12 @@
 
 callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不允许阻塞或 panic。
 扩展宿主需在自己的边界提供适当背压，不能在 callback 内做阻塞网络或 stdout 写入。
-`AgentConfig` 只有 `system: String` 与 `max_steps: NonZeroU32`，默认上限 20；没有统一总时限或 token 预算。
+`AgentConfig` 有 `system: String`、`max_steps: NonZeroU32` 与 `tool_repeat_limit: Option<NonZeroU32>`。
+max_steps 默认 20，tool_repeat_limit 默认 None（关闭）；没有统一总时限或 token 预算。
+核心接受任何非零重复上限，1 表示首个非空工具批次即被阻止；CLI 参数限定至少 2，详见 [CLI 设计](../cli/design.md)。
+新增公开配置字段需要完整 struct literal 的库调用方补字段或使用 `..AgentConfig::default()`；
+`AgentError` 新增 `ToolLoop`，穷尽匹配旧变体的库调用方也需要更新。
+默认行为、现有 Message/Event 形状和 RunOutcome 变体保持不变。
 
 ## 接受 run 与状态推进
 
@@ -24,15 +29,16 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 3. 设置 `Running { step: 0, phase: Model }`，发 RunStarted，再提交 User。
 4. 快照当前可见工具定义；step 从 1 到 max_steps，每轮开始检查取消。
 5. 设置 Model 阶段，发 StepStarted；将只读历史和定义借给 `Model::complete`。
-6. 成功时校验完整 Assistant，提交后如果没有调用则 Completed（若此时已取消则 Cancelled）。
+6. 成功时校验并提交完整 Assistant；启用保护时更新当前 run 的工具批次重复计数。
+   没有调用则 Completed（若此时已取消则 Cancelled），不受重复上限影响。
 7. 有调用时进入 Tools 阶段，逐条执行/跳过并提交结果；检查取消后决定是否进入下一轮。
-8. run_loop 返回后设置 Finished，并发一次 RunFinished；发生模型错误时 state/event 为 Failed，但函数返回 Err。
+8. run_loop 返回后设置 Finished，并发一次 RunFinished；模型错误或重复保护触发时 state/event 为 Failed，但函数返回 Err。
 
 默认接受任何 Finished 后的下一次 run；同一个 Agent 保留上一次用户输入及已提交历史。
 模型错误不会撤销已有 User；没有“失败 run 自动回滚到之前”的逻辑。
 
 上面描述普通 `run` 的自动运行路径。调试路径在初始模型前、完整 Assistant 提交后、
-每条 Tool 结果提交后调用安全 checkpoint；Step/Continue 决定继续方式，Cancel 仍沿本循环结束。
+正常批次的每条 Tool 结果提交后调用安全 checkpoint；Step/Continue 决定继续方式，Cancel 仍沿本循环结束。
 最后无工具回复和达到上限的最后工具结果均可在终态前检查；调试用户还需释放 `Finish` 动作。
 快照、Pause/Inspect、ID 校验和消息中间态见[调试设计](../debugger/design.md)，不另建一份 Agent 执行实现。
 
@@ -46,12 +52,32 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 每个调用遵循：
 
 - 已取消：构造 `ToolOutput::Error { code: "cancelled", ... }`，不发 ToolStarted、不调用 registry。
-- 未取消：发 ToolStarted，再调用 registry；registry 会再次检查 token、工具存在性和权限。
+- 未取消且批次被重复保护阻止：构造 code 为 tool_loop 的错误，不发 ToolStarted、不调用 registry。
+- 未取消且未被保护阻止：发 ToolStarted，再调用 registry；registry 会再次检查 token、工具存在性和权限。
 - 得到结果后统一提交 `Message::Tool { call_id, output }`，然后 `yield_now().await`。
 
 `ToolStarted` 表示调度器开始处理该调用，不代表已经授权或产生了副作用。
-串行执行使 tool result 顺序等于调用顺序。最后一轮仍执行并记录工具结果，再返回 StepLimit。
+串行执行使 tool result 顺序等于调用顺序。未触发重复保护的最后一轮仍执行并记录工具结果，再返回 StepLimit。
 不要为节约一条结果在达到上限时留下悬空 tool call。
+
+### 可选工具批次重复保护
+
+每个非空 Assistant 工具批次计一次：名称、参数值和顺序均与上一批相同时增加连续计数，
+不同批次重新从 1 计数。调用 ID、Assistant 文本和 usage 不参与比较。
+参数按 `serde_json::Value` 判等，不按 JSON 字符串判等；同一批内多个相同调用不会各自增加计数。
+检测状态为 `run_loop` 独占的上一批值副本及计数，失败、取消或自然结束后下一 user turn 都从零开始。
+
+达到 `tool_repeat_limit` 的当前 Assistant 已通过校验并提交，但该批没有任何工具获得执行机会。
+沿原有逐调用循环提交 `ToolOutput::Error { code: "tool_loop", ... }`，不发 ToolStarted，每条结果仍 yield。
+调试 AfterModel 保留完整 pending_calls，next 为 `Finish { outcome: Failed }`；
+Step/Continue 释放这一 Finish 后，整批补齐结果再终止，不产生 AfterTool 暂停或额外模型请求。
+闭合整批后返回 `AgentError::ToolLoop { limit: NonZeroU32 }`，state 和终态事件为 Failed。
+重复上限与模型步数上限同轮达到时，以 ToolLoop 失败结束。
+
+取消检查先于每条保护结果：已写入的 tool_loop 结果保留，尚未写入的调用补 cancelled；
+在 Finish(Failed) 暂停处、结果闭合中或最后结果提交后观察到取消，均返回 Cancelled，
+不再等待人工释放或返回 ToolLoop。已有模型、真实工具的取消和清理路径不变。
+该保护不检测交替出现的不同批次，不识别工具输出中的实际进展，也不撤销先前批次的副作用。
 
 ## 结束与错误矩阵
 
@@ -62,6 +88,7 @@ callback 实际类型为 `&mut (dyn FnMut(Event) + Send)`；同步调用，不�
 | 模型等待期间取消 / 模型返回 Cancelled | Ok(Cancelled) | 丢弃未完成的模型响应，不提交半条 Assistant |
 | 模型 HTTP/协议/transport 错误或非法 Assistant | Err(Model(...)) | 设置 Failed，已有消息保留，发 RunFinished(Failed) |
 | 工具 unknown/denied/参数/IO/timeout 错误 | 当前 step 继续 | 作为 ToolOutput 提交，模型可基于结果继续 |
+| 相同有序工具批次达到配置上限且未取消 | Err(ToolLoop { limit }) | Assistant 保留；该批全部补 tool_loop，不执行；设置 Failed 并发 RunFinished |
 | 工具运行期间 token 取消 | Ok(Cancelled)（清理和配对后） | 当前工具返回实际结果，剩余调用补 cancelled |
 | 助手不再调用工具 | Ok(Completed)，或取消已观察时 Cancelled | 完整 Assistant 已提交 |
 | 最后一步仍产生工具调用且未取消 | Ok(StepLimit) | 所有调用都有结果，无额外模型总结 |
@@ -100,9 +127,15 @@ Tool 调用不放在外层 cancel-select 中，避免丢弃执行 future 造成�
 | 模型失败无半条助手消息 | `provider_error_leaves_no_partial_assistant` |
 | 启动前和等待中取消 | `pre_cancelled_run_does_not_call_model`、`host_cancellation_stops_a_pending_model` |
 | 丢弃后不可续跑 | `dropping_a_run_prevents_ambiguous_resume` |
+| 相同批次忽略 ID/对象键序；整批不执行、失败优先于步数上限、下次 run 计数重置 | `repeated_tool_batch_closes_every_call_without_executing_the_batch` |
+| 名称、参数、数量、顺序变化打断重复 | `tool_batch_changes_break_the_repeat_streak` |
+| 默认关闭；同批 32 个相同调用只计一次 | `tool_repeat_guard_is_disabled_by_default_and_counts_batches` |
+| 核心上限 1 阻止首批；调试 Finish 闭合整批、无工具动作；无工具回答不受保护影响 | `tool_repeat_guard_debug_finish_closes_the_batch_without_tool_actions` |
+| Finish 暂停、部分/全部保护结果提交后取消优先 | `cancellation_overrides_a_tripped_tool_repeat_guard_before_and_during_closure` |
 | 立即完成的 32 个工具结果与宿主公平性 | [CLI 测试](../../../tests/cli_http.rs) `a_full_batch_of_immediate_tool_errors_does_not_overflow_output` |
 
-尚无空输入、超过 32 个调用、所有 panic/drop 时点、超长会话的穷尽测试；也无持久化恢复或并行工具合同。
+尚无空输入、超过 32 个调用、所有 panic/drop 时点、超长会话的穷尽测试；重复保护不证明任务停滞或成功。
+也无持久化恢复或并行工具合同。
 修改时检查：step 计数定义、terminal 位置、所有调用配对、模型/工具不同的取消策略、
 event sink 是否还非阻塞、同步完成路径是否仍让出调度。新并发或恢复能力先补跨模块设计与真实失败用例。
 调试专属命令与安全边界验收集中在[debugger 设计](../debugger/design.md#测试与变更检查)，避免重复维护两套合同。

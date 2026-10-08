@@ -299,9 +299,11 @@ fn malformed_or_incomplete_streams_never_execute_tools() {
         let server = Server::start(vec![response(body)]);
         let output = command(dir.path(), &server.base_url)
             .arg("--allow-write")
+            .args(["--http-retries", "3"])
             .output()
             .unwrap();
         assert_outcome(&output, 1, "failed");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid model stream"));
         assert!(events(&output).iter().all(|e| e["type"] != "tool_started"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert_eq!(server.finish().len(), 1);
@@ -317,8 +319,270 @@ fn http_error_body_is_not_leaked_or_retried() {
     }]);
     let output = command(dir.path(), &server.base_url).output().unwrap();
     assert_outcome(&output, 1, "failed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("HTTP 429"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET-FROM-GATEWAY"));
     assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn opted_in_http_retries_replay_only_rejected_statuses_with_the_same_request() {
+    for status in [429, 502, 503, 504] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start(vec![
+            Response {
+                status,
+                body: "SECRET-FROM-GATEWAY".into(),
+            },
+            final_text("recovered"),
+        ]);
+        let output = command(dir.path(), &server.base_url)
+            .args(["--http-retries", "1", "--max-steps", "1"])
+            .output()
+            .unwrap();
+        assert_outcome(&output, 0, "completed");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET-FROM-GATEWAY"));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2, "HTTP {status}");
+        assert_eq!(requests[0], requests[1], "retry must replay the same body");
+        let observed = events(&output);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| event["type"] == "step_started")
+                .count(),
+            1,
+            "HTTP attempts are not Agent steps"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| event["message"]["role"] == "assistant")
+                .count(),
+            1
+        );
+    }
+    for status in [400, 401, 403, 408, 425, 500] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start(vec![Response {
+            status,
+            body: String::new(),
+        }]);
+        let output = command(dir.path(), &server.base_url)
+            .args(["--http-retries", "3"])
+            .output()
+            .unwrap();
+        assert_outcome(&output, 1, "failed");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("HTTP {status}")));
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+fn opted_in_http_retry_budget_stops_after_the_initial_request_and_three_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(
+        (0..4)
+            .map(|_| Response {
+                status: 503,
+                body: "SECRET-FROM-GATEWAY".into(),
+            })
+            .collect(),
+    );
+    let output = command(dir.path(), &server.base_url)
+        .args(["--http-retries", "3"])
+        .output()
+        .unwrap();
+    assert_outcome(&output, 1, "failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("HTTP 503"));
+    assert!(!stderr.contains("SECRET-FROM-GATEWAY"));
+    assert!(
+        events(&output)
+            .iter()
+            .all(|event| event["message"]["role"] != "assistant")
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| request == &requests[0]));
+}
+
+#[tokio::test]
+async fn http_retry_backoff_is_cancellable_without_a_followup_request() {
+    use turnforge::{
+        CancellationToken, Model,
+        model::{ModelError, ModelRequest},
+        openai::OpenAiModel,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (rejected, ready) = tokio::sync::oneshot::channel();
+    let observer = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        read_request(&mut socket);
+        socket
+            .write_all(b"HTTP/1.1 503 Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        drop(socket);
+        rejected.send(()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(350);
+        let mut requests = 1;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    requests += 1;
+                    drop(socket);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("HTTP observer failed: {error}"),
+            }
+        }
+        requests
+    });
+    let model = OpenAiModel::new_local(&url, "fixture", Duration::from_secs(3))
+        .unwrap()
+        .with_http_retries(3)
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut deltas = Vec::new();
+    let mut emit = |delta| deltas.push(delta);
+    let request = ModelRequest {
+        system: "fixture",
+        messages: &[],
+        tools: &[],
+    };
+    let (result, ()) = tokio::join!(model.complete(request, &cancel, &mut emit), async {
+        ready.await.unwrap();
+        // Let the 503 reach the client, then cancel during its 100 ms wait.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        cancel.cancel();
+    });
+    assert!(matches!(result, Err(ModelError::Cancelled)));
+    assert!(deltas.is_empty());
+    assert_eq!(
+        observer.join().unwrap(),
+        1,
+        "cancellation must end the request lifecycle"
+    );
+}
+
+#[tokio::test]
+async fn opted_in_http_retries_do_not_replay_transport_failures() {
+    use turnforge::{
+        CancellationToken, Model,
+        model::{ModelError, ModelRequest},
+        openai::OpenAiModel,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let observer = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        read_request(&mut socket);
+        // The server accepted the POST but closes without an HTTP response.
+        // Its processing status is unknown, so replay is prohibited.
+        drop(socket);
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(350);
+        let mut requests = 1;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    requests += 1;
+                    drop(socket);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("HTTP observer failed: {error}"),
+            }
+        }
+        requests
+    });
+    let model = OpenAiModel::new_local(&url, "fixture", Duration::from_secs(3))
+        .unwrap()
+        .with_http_retries(3)
+        .unwrap();
+    let mut deltas = Vec::new();
+    let result = model
+        .complete(
+            ModelRequest {
+                system: "fixture",
+                messages: &[],
+                tools: &[],
+            },
+            &CancellationToken::new(),
+            &mut |delta| deltas.push(delta),
+        )
+        .await;
+    assert!(matches!(result, Err(ModelError::Transport(_))));
+    assert!(deltas.is_empty());
+    assert_eq!(observer.join().unwrap(), 1);
+}
+
+#[test]
+fn repeated_tool_batch_guard_closes_calls_before_a_second_real_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = tool(
+        "write_file",
+        json!({"path":"guard.txt","content":"first execution"}),
+    );
+    let second = Response {
+        status: 200,
+        body: first.body.replace("call-1", "call-2"),
+    };
+    let server = Server::start(vec![first, second]);
+    let output = command(dir.path(), &server.base_url)
+        .args(["--allow-write", "--tool-repeat-limit", "2"])
+        .output()
+        .unwrap();
+    assert_outcome(&output, 1, "failed");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("same ordered tool batch repeated 2 times")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("guard.txt")).unwrap(),
+        "first execution"
+    );
+    let observed = events(&output);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event["type"] == "step_started")
+            .count(),
+        2,
+        "the guard must stop before starting a third model step"
+    );
+    let starts: Vec<_> = observed
+        .iter()
+        .filter(|event| event["type"] == "tool_started")
+        .collect();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["call"]["id"], "call-1");
+    let results: Vec<_> = observed
+        .iter()
+        .filter(|event| event["message"]["role"] == "tool")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["message"]["call_id"], "call-1");
+    assert_eq!(results[0]["message"]["output"]["status"], "ok");
+    assert_eq!(results[1]["message"]["call_id"], "call-2");
+    assert_eq!(results[1]["message"]["output"]["code"], "tool_loop");
+    assert_eq!(
+        server.finish().len(),
+        2,
+        "the guard must stop before a third model request"
+    );
 }
 
 #[test]
@@ -471,6 +735,16 @@ fn model_endpoint_configuration_rejects_plaintext_remote_and_url_secrets() {
         )
         .is_err()
     );
+    for max_retries in 0..=4 {
+        let configured = OpenAiModel::new_local(
+            "http://127.0.0.1:1234/v1",
+            "fixture",
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_http_retries(max_retries);
+        assert_eq!(configured.is_ok(), max_retries <= 3);
+    }
 }
 
 #[test]

@@ -10,7 +10,8 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use turnforge::{
-    Agent, AgentConfig, CancellationToken, Event, Model, RunOutcome, RunState,
+    Agent, AgentConfig, AgentError, CancellationToken, DebugAction, DebugCommand, DebugPoint,
+    Event, Model, RunOutcome, RunState, debug_channel,
     message::{AssistantMessage, Message, ToolCall, ToolOutput},
     model::{ModelDelta, ModelError, ModelRequest},
     tools::{Capability, Permissions, Tool, ToolDefinition, ToolRegistry},
@@ -303,4 +304,315 @@ async fn dropping_a_run_prevents_ambiguous_resume() {
         agent.run("again", &token, &mut sink).await,
         Err(turnforge::AgentError::Interrupted)
     ));
+}
+
+#[tokio::test]
+async fn repeated_tool_batch_closes_every_call_without_executing_the_batch() {
+    let first = vec![
+        ToolCall {
+            arguments: json!({"path":"a", "line":1}),
+            ..call("a")
+        },
+        ToolCall {
+            arguments: json!({"path":"b"}),
+            ..call("b")
+        },
+    ];
+    let repeated = vec![
+        ToolCall {
+            arguments: json!({"line":1, "path":"a"}),
+            ..call("fresh-a")
+        },
+        ToolCall {
+            arguments: json!({"path":"b"}),
+            ..call("fresh-b")
+        },
+    ];
+    let model = script(vec![
+        Ok(reply(first.clone())),
+        Ok(reply(repeated)),
+        Ok(reply(first)),
+        Ok(reply(vec![])),
+    ]);
+    let histories = model.histories.clone();
+    let count = Arc::new(AtomicUsize::new(0));
+    let limit = NonZeroU32::new(2).unwrap();
+    let mut agent = Agent::new(
+        model,
+        registry(count.clone(), false),
+        AgentConfig {
+            max_steps: limit,
+            tool_repeat_limit: Some(limit),
+            ..AgentConfig::default()
+        },
+    );
+    let mut events = Vec::new();
+    assert!(matches!(
+        agent
+            .run("stop the loop", &CancellationToken::new(), &mut |event| {
+                events.push(event)
+            })
+            .await,
+        Err(AgentError::ToolLoop { limit: actual }) if actual == limit
+    ));
+    assert_eq!(histories.lock().unwrap().len(), 2);
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert_eq!(agent.messages().len(), 7);
+    for (message, expected_id) in agent.messages()[5..].iter().zip(["fresh-a", "fresh-b"]) {
+        assert!(
+            matches!(message, Message::Tool { call_id, output: ToolOutput::Error { code, .. } }
+                if call_id == expected_id && code == "tool_loop")
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolStarted { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(terminal_events(&events), 1);
+    assert_eq!(
+        agent.state(),
+        &RunState::Finished {
+            outcome: RunOutcome::Failed
+        }
+    );
+    // A failed run leaves closed history, but no detector state carries into
+    // the next user turn, even when it requests the exact same operations.
+    assert_eq!(
+        agent
+            .run("try again", &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap(),
+        RunOutcome::Completed
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn tool_batch_changes_break_the_repeat_streak() {
+    let a = ToolCall {
+        arguments: json!({"path":"a"}),
+        ..call("a")
+    };
+    let b = ToolCall {
+        arguments: json!({"path":"b"}),
+        ..call("b")
+    };
+    // Every dimension changes the requested operations: order, length,
+    // arguments or name. None should be treated as the previous batch.
+    for changed in [
+        vec![b.clone(), a.clone()],
+        vec![a.clone()],
+        vec![
+            a.clone(),
+            ToolCall {
+                arguments: json!({"path":"c"}),
+                ..b.clone()
+            },
+        ],
+        vec![
+            a.clone(),
+            ToolCall {
+                name: "unregistered".into(),
+                ..b.clone()
+            },
+        ],
+    ] {
+        let mut agent = Agent::new(
+            script(vec![
+                Ok(reply(vec![a.clone(), b.clone()])),
+                Ok(reply(changed)),
+                Ok(reply(vec![])),
+            ]),
+            registry(Arc::default(), false),
+            AgentConfig {
+                tool_repeat_limit: NonZeroU32::new(2),
+                ..AgentConfig::default()
+            },
+        );
+        assert_eq!(
+            agent
+                .run("make progress", &CancellationToken::new(), &mut |_| {})
+                .await
+                .unwrap(),
+            RunOutcome::Completed
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_repeat_guard_is_disabled_by_default_and_counts_batches() {
+    assert!(AgentConfig::default().tool_repeat_limit.is_none());
+    for limit in [None, NonZeroU32::new(2)] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut replies = vec![Ok(reply((0..32).map(|id| call(&id.to_string())).collect()))];
+        if limit.is_none() {
+            replies.push(Ok(reply(vec![call("again")])));
+            replies.push(Ok(reply(vec![call("again-again")])));
+        }
+        replies.push(Ok(reply(vec![])));
+        let mut agent = Agent::new(
+            script(replies),
+            registry(count.clone(), false),
+            AgentConfig {
+                tool_repeat_limit: limit,
+                ..AgentConfig::default()
+            },
+        );
+        assert_eq!(
+            agent
+                .run(
+                    "independent operations",
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            RunOutcome::Completed
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            if limit.is_none() { 34 } else { 32 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_repeat_guard_debug_finish_closes_the_batch_without_tool_actions() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        script(vec![
+            Ok(reply(vec![call("a"), call("b")])),
+            Ok(reply(vec![])),
+        ]),
+        registry(count.clone(), false),
+        AgentConfig {
+            tool_repeat_limit: NonZeroU32::new(1),
+            ..AgentConfig::default()
+        },
+    );
+    let cancel = CancellationToken::new();
+    let (controller, session) = debug_channel(&cancel);
+    let mut snapshots = Vec::new();
+    let mut events = Vec::new();
+    let result = agent
+        .run_debug("inspect blocked calls", session, &mut |event| {
+            if let Event::DebugPaused { snapshot } = &event {
+                snapshots.push((**snapshot).clone());
+                controller
+                    .try_send(DebugCommand::Step {
+                        pause_id: snapshot.pause_id,
+                    })
+                    .unwrap();
+            }
+            events.push(event);
+        })
+        .await;
+    assert!(matches!(result, Err(AgentError::ToolLoop { .. })));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(snapshots.len(), 2);
+    assert!(matches!(snapshots[1].point, DebugPoint::AfterModel));
+    assert_eq!(snapshots[1].pending_calls, vec![call("a"), call("b")]);
+    assert_eq!(snapshots[1].messages.len(), 2);
+    assert!(matches!(
+        snapshots[1].next,
+        DebugAction::Finish {
+            outcome: RunOutcome::Failed
+        }
+    ));
+    assert_eq!(agent.messages().len(), 4);
+    assert!(agent.messages()[2..].iter().all(|message| matches!(
+        message,
+        Message::Tool { output: ToolOutput::Error { code, .. }, .. } if code == "tool_loop"
+    )));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, Event::ToolStarted { .. }))
+    );
+    assert_eq!(terminal_events(&events), 1);
+    assert_eq!(
+        agent
+            .run("text only", &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap(),
+        RunOutcome::Completed
+    );
+}
+
+#[tokio::test]
+async fn cancellation_overrides_a_tripped_tool_repeat_guard_before_and_during_closure() {
+    for cancel_after_results in 0..=2 {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(
+            script(vec![Ok(reply(vec![call("a"), call("b")]))]),
+            registry(count.clone(), false),
+            AgentConfig {
+                tool_repeat_limit: NonZeroU32::new(1),
+                ..AgentConfig::default()
+            },
+        );
+        let cancel = CancellationToken::new();
+        let (controller, session) = debug_channel(&cancel);
+        let mut events = Vec::new();
+        let mut committed_results = 0;
+        let result = agent
+            .run_debug("cancel blocked calls", session, &mut |event| {
+                if let Event::DebugPaused { snapshot } = &event {
+                    let should_cancel = cancel_after_results == 0
+                        && matches!(snapshot.point, DebugPoint::AfterModel);
+                    if should_cancel {
+                        controller.cancel();
+                    } else {
+                        controller
+                            .try_send(DebugCommand::Step {
+                                pause_id: snapshot.pause_id,
+                            })
+                            .unwrap();
+                    }
+                }
+                if matches!(
+                    event,
+                    Event::MessageCommitted {
+                        message: Message::Tool { .. }
+                    }
+                ) {
+                    committed_results += 1;
+                    if committed_results == cancel_after_results {
+                        controller.cancel();
+                    }
+                }
+                events.push(event);
+            })
+            .await;
+        assert_eq!(result.unwrap(), RunOutcome::Cancelled);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let results: Vec<_> = agent
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    output: ToolOutput::Error { code, .. },
+                    ..
+                } => Some(code.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            match cancel_after_results {
+                0 => vec!["cancelled", "cancelled"],
+                1 => vec!["tool_loop", "cancelled"],
+                _ => vec!["tool_loop", "tool_loop"],
+            }
+        );
+        assert_eq!(terminal_events(&events), 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, Event::ToolStarted { .. }))
+        );
+    }
 }

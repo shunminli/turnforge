@@ -96,8 +96,22 @@ printf '%s' '读取 Cargo.toml 并解释依赖' | cargo run --locked -- run - --
 cargo run --locked -- run '分析项目' --max-steps 10 --request-timeout 120 --tool-timeout 30
 ```
 
-`--max-steps` 计模型请求，不是工具调用数；`--request-timeout` 覆盖每次请求及流读取，
+`--max-steps` 计模型步骤，不是工具调用数或 HTTP 尝试数；`--request-timeout` 覆盖每次 HTTP 尝试及流读取，
 `--tool-timeout` 只配置 shell。完整范围和默认值仍由 [CLI 配置合同](modules/cli/design.md#公共入口)维护。
+
+两项可选可靠性策略默认关闭；`run` 与 `debug` 共用，Lab 固定关闭：
+
+```sh
+cargo run --locked -- run '分析项目' --tool-repeat-limit 3 --http-retries 2
+```
+
+连续三个模型步骤给出相同的有序工具批次时，第三批不执行，所有调用得到 `tool_loop`，运行失败退出 1。
+比较工具名与参数，忽略 call ID；同一批内的重复调用不会累加计数，每个用户 turn 重新计数。
+它不能判断语义无进展或检测交替批次循环，也不回滚此前副作用。
+
+HTTP 重试只针对 429/502/503/504，最多额外三次，等待 100/200/400ms，可取消。
+传输失败、成功响应格式错误、已经开始的 SSE 流都不重试，避免重复暂态输出。
+请求超时按尝试计算，不是所有尝试加退避的总 deadline；重试不保证提供方无处理或无费用。
 
 `--json` 的 stdout 每行一个事件，可能包含敏感的 prompt、模型文本、工具参数与结果。
 普通文本流也可能只是暂态结果；自动化应结合退出码与完整终态判断。

@@ -66,6 +66,7 @@
 
 以下记录保留当时的范围、输入和结果，不作为今天的操作手册或通过证明：
 
+- [OpenCoder 可靠性能力吸收验收（2026-10-08）](verification/opencoder-adoption-2026-10-08.md)：同步基线、接口/owner、真实 HTTP/文件证据及完整 CI 结果。
 - [Lab 与学习实现计划](harness-lab-plan.md)：入口、权限、生命周期及本轮完成证据。
 - [Lab 与学习验收记录（2026-09-14）](verification/harness-lab-2026-09-14.md)：冻结实现、首次失败、独立门禁和真实用户入口验证。
 - [调试实现计划](debugging-plan.md)：本轮实现范围与验收台账，不代替模块当前设计。
