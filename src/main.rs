@@ -1,6 +1,6 @@
 use std::{
     io::{self, Read},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
     process::ExitCode,
     sync::atomic::{AtomicU64, Ordering},
@@ -95,6 +95,9 @@ struct RunArgs {
     /// Retry HTTP 429/502/503/504 before streaming (0-3; default: disabled).
     #[arg(long, default_value = "0", value_parser = clap::value_parser!(u8).range(0..=3))]
     http_retries: u8,
+    /// Reject larger complete JSON request bodies before HTTP (bytes; opt-in).
+    #[arg(long)]
+    max_request_bytes: Option<NonZeroUsize>,
     /// Total timeout for each HTTP model request, including streaming (seconds).
     #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..=3600))]
     request_timeout: u64,
@@ -173,6 +176,7 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
                 max_steps: NonZeroU32::new(4).unwrap(),
                 tool_repeat_limit: None,
                 http_retries: 0,
+                max_request_bytes: None,
                 request_timeout: 90,
                 json: false,
             };
@@ -238,6 +242,11 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
         )?
     }
     .with_http_retries(args.http_retries)?;
+    let model = if let Some(limit) = args.max_request_bytes {
+        model.with_max_request_bytes(limit)
+    } else {
+        model
+    };
     let mut config = AgentConfig {
         max_steps: args.max_steps,
         tool_repeat_limit: args.tool_repeat_limit.and_then(NonZeroU32::new),
@@ -446,6 +455,7 @@ mod tests {
             };
             assert_eq!(args.http_retries, 0);
             assert_eq!(args.tool_repeat_limit, None);
+            assert_eq!(args.max_request_bytes, None);
 
             let cli = Cli::try_parse_from([
                 "turnforge",
@@ -457,6 +467,8 @@ mod tests {
                 "3",
                 "--tool-repeat-limit",
                 "2",
+                "--max-request-bytes",
+                "1024",
             ])
             .unwrap();
             let (Command::Run(args) | Command::Debug(args)) = cli.command else {
@@ -464,6 +476,7 @@ mod tests {
             };
             assert_eq!(args.http_retries, 3);
             assert_eq!(args.tool_repeat_limit, Some(2));
+            assert_eq!(args.max_request_bytes.unwrap().get(), 1024);
         }
     }
 
@@ -474,6 +487,7 @@ mod tests {
             ("--http-retries", "-1"),
             ("--tool-repeat-limit", "0"),
             ("--tool-repeat-limit", "1"),
+            ("--max-request-bytes", "0"),
         ] {
             assert!(
                 Cli::try_parse_from([
@@ -488,5 +502,6 @@ mod tests {
                 .is_err()
             );
         }
+        assert!(Cli::try_parse_from(["turnforge", "lab", "--max-request-bytes", "1024"]).is_err());
     }
 }

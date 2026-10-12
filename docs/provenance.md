@@ -39,6 +39,22 @@ The inspected OpenCoder LICENSE grants MIT with `Copyright (c) 2026 MoSunDay`.
 Any future concrete copy must retain that notice and grant; this conceptual
 adaptation does not claim affiliation or a blanket clearance for future imports.
 
+## OpenCoder complete-evidence admission idea (2026-10-12)
+
+Reference inspected: [MoSunDay/opencoder](https://github.com/MoSunDay/opencoder),
+commit `3c44c26640ff289d409d1ebf1c57ae1a17f33196`. Primary reference area:
+`crates/brain/src/layered/budget.rs` complete-evidence admission and
+`crates/brain/src/layered/prompt.rs` bounded full instruction generation.
+
+Turnforge independently implements a narrower, opt-in policy at its actual
+`OpenAiModel::request` consumer: serialize the complete HTTP JSON body once,
+reject bodies larger than the explicit byte limit before sending, and retain
+all historical messages and tool evidence. This is an exact wire-body limit,
+not upstream's Brain reservation model, a token estimator, context compaction,
+output budget or peak-memory bound. No Brain/platform source, tests, assets or
+dependencies are vendored. The source LICENSE remains MIT with the notice above;
+future concrete imports still require their own license/notice checks.
+
 Turnforge's repository license remains Apache-2.0. Cargo dependencies retain
 their own licenses. This note records source provenance, not a legal clearance
 of the entire dependency graph or future upstream imports.

@@ -2,6 +2,7 @@
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
     time::Duration,
 };
 
@@ -10,7 +11,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{
     Client, ClientBuilder, Url,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,6 +30,7 @@ pub struct OpenAiModel {
     endpoint: Url,
     model: String,
     http_retries: u8,
+    max_request_bytes: Option<NonZeroUsize>,
 }
 
 impl OpenAiModel {
@@ -83,6 +85,15 @@ impl OpenAiModel {
         Ok(self)
     }
 
+    /// Limit the complete serialized UTF-8 JSON body, including system,
+    /// history, and tool definitions. The default is no limit. Equal size is
+    /// allowed; oversize requests fail before HTTP without trimming evidence.
+    /// This is a wire-body policy, not a token or peak-memory budget.
+    pub fn with_max_request_bytes(mut self, limit: NonZeroUsize) -> Self {
+        self.max_request_bytes = Some(limit);
+        self
+    }
+
     fn build(
         base_url: &str,
         api_key: Option<&str>,
@@ -135,6 +146,7 @@ impl OpenAiModel {
             endpoint,
             model: model.into(),
             http_retries: 0,
+            max_request_bytes: None,
         })
     }
 
@@ -165,12 +177,29 @@ impl OpenAiModel {
                 "type":"function", "function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
             })).collect());
         }
+        let bytes =
+            serde_json::to_vec(&body).map_err(|_| config("unable to serialize model request"))?;
+        drop(body);
+        if let Some(limit) = self.max_request_bytes
+            && bytes.len() > limit.get()
+        {
+            return Err(ModelError::RequestTooLarge {
+                limit: limit.get(),
+                actual: bytes.len(),
+            });
+        }
+        // Vec<u8> becomes a replayable byte body. Clone the request, not the
+        // JSON serialization, so every admitted retry sends identical bytes.
+        let request = self
+            .client
+            .post(self.endpoint.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(bytes);
         let mut retries = 0;
         let response = loop {
-            let response = self
-                .client
-                .post(self.endpoint.clone())
-                .json(&body)
+            let response = request
+                .try_clone()
+                .expect("serialized byte body is replayable")
                 .send()
                 .await
                 .map_err(transport)?;

@@ -39,6 +39,17 @@ pub trait Model: Send + Sync {
 消费模型对象并返回已配置对象；`0..=3` 有效，超出范围返回 `Configuration`。
 默认值为 0。CLI 的 `--http-retries` 是实际消费者，Lab 保持构造默认值。
 
+`OpenAiModel::with_max_request_bytes(self, limit: NonZeroUsize) -> Self` 消费并配置模型对象；
+默认 `None`（不限制），真实消费者是 run/debug 的 `--max-request-bytes`，Lab 固定关闭。
+每次 complete 把 system、全部历史（含 Assistant 调用与 ToolOutput）、可见工具定义及协议字段
+组装成完整 JSON，序列化一次为 UTF-8 字节 body 后释放临时 JSON 值；等于限制允许，
+大于限制返回 `ModelError::RequestTooLarge { limit: usize, actual: usize }`，尚未发送任何 HTTP 或 delta。
+诊断只包含字节数字，不回显 prompt、key、URL、schema 或工具证据；错误不触发 HTTP 重试。
+新增公开错误变体要求穷尽匹配 ModelError 的库调用方更新；Model/Agent/Message/Event 接口形状不变。
+该策略不裁剪/改写会话，不撤销之前模型步骤的已提交工具副作用，Agent 将本次模型失败置为 Failed。
+预算只计 HTTP body，不计 headers；按实际 UTF-8 与 JSON 转义计字节，不是字符数、token 数、
+模型上下文/输出预留或峰值内存预算。组装与序列化本身仍分配内存，也不是历史增长总预算。
+
 收到 HTTP 429/502/503/504 且预算未耗尽时，丢弃响应并按 100/200/400 ms 等待后重发原 JSON。
 最多是一次初始请求加三次重试；不读取失败响应正文，也不采用 Retry-After。
 其它 HTTP 状态直接失败；`.send()` 的 transport/timeout 错误、成功 HTTP 的 Content-Type 错误和所有
@@ -60,7 +71,8 @@ SSE/JSON/组装错误均不重试。收到失败状态只是本地重放政策�
 
 ## 3. 请求序列化
 
-每次模型调用先构造同一份 POST JSON，默认发送一次；启用 HTTP 重试时按上述政策重发。
+每次模型调用构造并序列化一次 POST JSON，做可选字节准入后以 application/json 发送，默认一次；
+启用 HTTP 重试时各 attempt 克隆同一个可重放字节请求，不重复序列化，完整字节内容保持相同。
 始终设置 `model`、`stream: true`、`stream_options.include_usage: true`。
 
 | 内部输入 | Chat Completions 请求内容 |
@@ -73,7 +85,7 @@ SSE/JSON/组装错误均不重试。收到失败状态只是本地重放政策�
 
 空 tools 时省略 `tools`；历史 usage 不进入请求。权限过滤在 Registry，provider 不代替权限判断。
 没有设置 temperature、max tokens、tool_choice、parallel_tool_calls 或任意 provider 参数透传。
-当前也没有请求体大小限制、上下文裁剪或历史合法性预检；通用会话结构由 Agent 管理。
+可选请求 body 上限仅做发送前准入；没有上下文裁剪或历史合法性预检，通用会话结构由 Agent 管理。
 
 ## 4. SSE 与 Assembly
 
@@ -107,6 +119,7 @@ provider 不检查工具是否注册、权限是否允许或输入是否符合�
 | `Configuration(String)` | URL、空 model/零 timeout、授权 header 或 retry limit 校验失败；错误不回显原配置值 |
 | `Transport(String)` | Client 构造或 `.send()` 失败；请求 URL 已移除，包括该阶段的 timeout；不重试 |
 | `HttpStatus(u16)` | 非 2xx；限定状态可按显式预算重试，预算耗尽或其它状态返回本错误；不读入诊断正文 |
+| `RequestTooLarge { limit, actual }` | 显式请求字节上限被完整 UTF-8 JSON body 超过；任何 HTTP 前失败，只输出数字，不裁剪历史或重试 |
 | `Protocol(String)` | Content-Type、SSE/JSON/组装校验失败；正文读取中断、读取超时和 2 MiB 限制也在 SSE 层统一映射为此类 |
 | `Cancelled` | `complete` 的优先取消分支；不是远端服务确认取消 |
 
@@ -129,6 +142,10 @@ Agent 把 `Cancelled` 转为取消 outcome，其余错误转为失败；模型�
 | `opted_in_http_retry_budget_stops_after_the_initial_request_and_three_retries` | 最多四次请求，耗尽返回最终 HTTP 状态，无 Assistant 或正文泄露 |
 | `http_retry_backoff_is_cancellable_without_a_followup_request` | 实际 HTTP 503 后取消，退避结束后没有额外请求或 delta |
 | `opted_in_http_retries_do_not_replay_transport_failures` | 服务器读入 POST 后无响应断开，未知处理结果不重发 |
+| `request_byte_limit_measures_complete_utf8_body_and_retries_identical_bytes` | 独立完整 wire oracle：system/Unicode/转义/全部历史/tool schema；等于限制允许、差一字节拒绝且无请求；默认关闭、原始字节重试相同、预取消优先 |
+| `cli_request_byte_limit_rejects_before_http_without_leaking_the_body` | 真实 run 因超限 Failed/退出 1，无 HTTP/Assistant/tool action，数字诊断不含 prompt/URL |
+| `later_request_byte_limit_preserves_completed_tools_and_closes_the_run` | 首轮真实写文件与配对结果保留；第二轮历史增大超限，无第二 HTTP/Assistant，不虚构回滚 |
+| `debug_cli_request_byte_limit_ends_without_http_or_tool_actions` | 真实 debug 释放首个安全点后同样发送前拒绝，并在控制 stdin 保持开放时完成退出 |
 | `model_endpoint_configuration_rejects_plaintext_remote_and_url_secrets` | 远程明文/URL 秘密/非法 header 拒绝，loopback HTTP 可用 |
 | `blocked_stdout_does_not_block_ctrl_c_or_process_exit` | 流式输出背压时整条宿主链路仍可取消，不证明远端停止 |
 
