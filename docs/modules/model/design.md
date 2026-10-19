@@ -50,10 +50,18 @@ pub trait Model: Send + Sync {
 预算只计 HTTP body，不计 headers；按实际 UTF-8 与 JSON 转义计字节，不是字符数、token 数、
 模型上下文/输出预留或峰值内存预算。组装与序列化本身仍分配内存，也不是历史增长总预算。
 
+`OpenAiModel::with_stream_idle_timeout(self, timeout: Duration) -> Result<Self, ModelError>`
+消费并配置模型对象，默认 `None`；拒绝零时长及无法表示为 Instant 截止点的时长，报固定配置诊断。
+真实消费者为 run/debug 的 `--stream-idle-timeout`，Lab 保持默认关闭。新增公开
+`ModelError::StreamIdleTimeout` 要求穷尽匹配错误变体的库消费者更新。此配置不改变 Model trait、
+Agent API 或 Message；追加输入的 Event 扩展另见[协议设计](../protocol/design.md)。
+计时和边界见下一节；此错误只输出固定诊断，不输出 URL、key、prompt 或响应正文。
+
 收到 HTTP 429/502/503/504 且预算未耗尽时，丢弃响应并按 100/200/400 ms 等待后重发原 JSON。
 最多是一次初始请求加三次重试；不读取失败响应正文，也不采用 Retry-After。
 其它 HTTP 状态直接失败；`.send()` 的 transport/timeout 错误、成功 HTTP 的 Content-Type 错误和所有
 SSE/JSON/组装错误均不重试。收到失败状态只是本地重放政策的依据，不证明远端没有处理请求。
+`StreamIdleTimeout` 发生在成功 HTTP 之后，同样不重试，即使配置了 HTTP 状态重试。
 重试发生在 SSE 解析前，因此没有重试前的 delta、Assistant 提交或工具执行需要撤销。
 重试计数归单次模型 future，不修改 Agent step；只有最终成功响应的 usage 进入 AssistantMessage。
 `complete` 的优先 cancel-select 同时覆盖 HTTP 与等待；没有独立任务、长期 token 字段或重试 channel。
@@ -93,6 +101,18 @@ SSE/JSON/组装错误均不重试。收到失败状态只是本地重放政策�
 `eventsource-stream` 处理 framing/UTF-8 分片；累计读取的响应 body chunk 超过 2 MiB 即失败。
 限制发生在 SSE 解析前，包含 framing 字节；不包含 HTTP headers，也不是 token 上限。
 
+启用 stream idle timeout 时，在成功 HTTP headers 和 Content-Type 校验后记录本次请求的
+最近事件时刻，以 `timeout_at` 等待 `eventsource-stream::EventStream::next`。只有完整 data event
+会从该流返回；comment、空白心跳、仅 id/retry 字段和未闭合 data 分片都不重置截止点。
+JSON 能解析且通过 `Assembly::push` 校验后记录新的时刻；`[DONE]` 则立即完成校验并返回，
+无需另等一轮。非法 JSON、error event 和其它解析错误立即失败，不为它们重置并继续等待。
+每次等待都由当前 `request` future 独占，没有轮询任务、共享时钟或跨请求计时状态。
+
+这是“等待下一完整 SSE data event”的时限，不是字节活动、token 生成或业务进展检查；
+合法的空 delta/usage event 也重置。同步 emit 必须保持非阻塞，计时不保证抢占阻塞回调。
+成功响应前仍只受已有连接/请求超时约束。总 HTTP 请求时限不因完整事件到达而重置；
+若总时限先耗尽，仍沿已有 Transport/Protocol 映射返回，并非 StreamIdleTimeout。
+
 `Assembly` 独占 text、`BTreeMap<u32, PendingCall>`、可选 usage 和 finish_reason。
 收到数据后按以下规则处理：
 
@@ -120,6 +140,7 @@ provider 不检查工具是否注册、权限是否允许或输入是否符合�
 | `Transport(String)` | Client 构造或 `.send()` 失败；请求 URL 已移除，包括该阶段的 timeout；不重试 |
 | `HttpStatus(u16)` | 非 2xx；限定状态可按显式预算重试，预算耗尽或其它状态返回本错误；不读入诊断正文 |
 | `RequestTooLarge { limit, actual }` | 显式请求字节上限被完整 UTF-8 JSON body 超过；任何 HTTP 前失败，只输出数字，不裁剪历史或重试 |
+| `StreamIdleTimeout` | 成功 HTTP 后，等待下一完整 SSE data event 的显式 idle 时限耗尽；固定诊断，无重试 |
 | `Protocol(String)` | Content-Type、SSE/JSON/组装校验失败；正文读取中断、读取超时和 2 MiB 限制也在 SSE 层统一映射为此类 |
 | `Cancelled` | `complete` 的优先取消分支；不是远端服务确认取消 |
 
@@ -152,6 +173,19 @@ Agent 把 `Cancelled` 转为取消 outcome，其余错误转为失败；模型�
 [agent.rs 测试](../../../tests/agent.rs)中的 `invalid_calls_never_commit_or_execute`、
 `provider_error_leaves_no_partial_assistant` 和 `host_cancellation_stops_a_pending_model`
 分别补充通用调用校验、失败提交边界和不配合取消的 provider future 被丢弃的合同。
+
+[stream_idle.rs](../../../tests/stream_idle.rs) 通过真实 loopback HTTP 使用生产适配器，覆盖：
+
+| 用例 | 保护的合同 |
+|---|---|
+| `stalled_streams_never_commit_or_execute_provisional_tools_or_retry` | headers 后无 event、完整工具/finish 后缺 DONE 均为 idle 失败；真实 Agent 不提交 Assistant、不执行获授权 write_file，无文件且只有一条 POST，即使启用重试 |
+| `complete_events_reset_idle_and_the_default_has_no_idle_limit` | 完整事件维持总时长超过单个 idle 时限的流；默认关闭允许较慢首 event；DONE 正常完成 |
+| `comments_and_partial_frames_cannot_keep_a_stalled_stream_alive` | 连续心跳 comment、未闭合 data 分片不会续期，即使服务端计划稍后合法完成 |
+| `request_timeout_still_bounds_headers_and_an_active_stream` | 尚无 headers 时总时限产生 Transport；持续完整事件仍被总时限打断并沿 Protocol 返回 |
+| `invalid_idle_limits_and_cancellation_preserve_existing_boundaries` | 零/不可表示时长拒绝；预取消不发送 HTTP；已产生真实 delta 后取消返回 Cancelled |
+
+以上均不调用真实 LLM；有界调度下的有限时间样例不覆盖所有 deadline 同时就绪的交错。
+它们不证明提供方收到本地取消后停止生成，也不证明暂停中的调试会话需要模型 idle 计时。
 
 [lab_cli.rs](../../../tests/lab_cli.rs) 的 `lab_auto_chat_ignores_stdin_and_inherited_cloud_configuration`
 通过真实 CLI/local provider 检查固定本地配置和无 Authorization 的模型请求；Lab 上层 origin 边界另由

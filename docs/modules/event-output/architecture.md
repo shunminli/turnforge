@@ -6,7 +6,7 @@
 
 ## 职责边界
 
-把 Agent 产生的有序暂态事件，投影成 CLI stdout 的文本或 NDJSON 字节，并交付宿主课程/帮助/验收 Notice。
+把 Agent 事件和宿主的 steer 接纳回执，投影成 CLI stdout 的文本或 NDJSON 字节，并交付宿主课程/帮助/验收 Notice。
 在 pipe/TTY 不消费时保留可取消性，并让输出失败反馈到宿主取消路径。
 不生成会话事实、不修改 Agent、不重试模型，也不负责工具进程清理。
 不提供持久化、至少一次/恰好一次交付、断线续传、事件版本协商或日志脱敏。
@@ -18,7 +18,7 @@ RunFinished 在库中被发出，不代表它已成功排队、写完、被读�
 ## 数据通路
 
 ```text
-Agent::run / run_debug 同步 emit(Event) + CLI Notice
+Agent::run / run_debug 同步 emit(Event) + CLI 接纳 Event / Notice
   → CLI sink.try_send(OutputItem) → 64 项 mpsc → forward
       │                                  ├─ NDJSON: serialize + '\n'
       │                                  ├─ 文本: delta / 结束换行 / 调试快照与控制通知
@@ -31,6 +31,8 @@ Agent::run / run_debug 同步 emit(Event) + CLI Notice
 
 run 与 control 各持一个 Sender，`forward` 由 writer future 持有；它们通过 `join!` 并发轮询，无独立后台任务。
 OutputItem::Notice 只属于 binary 的文本交付，不新增库 Event。learn 使用单 Notice 的容量 1 channel。
+SteerQueued 和 CLI 接纳失败的 SteerRejected 使用 OutputItem::Event，不直接写 stdout、stderr 或 Notice；
+JSON 模式仍为纯 Event 流。回执状态由输入/Agent owner 决定，writer 不确认模型采用了指令。
 注册、关闭、取消的宿主级顺序见 [CLI 架构](../cli/architecture.md)。
 
 ## owner 与资源生命周期

@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     CancellationToken, Event, Model, Phase, RunOutcome, RunState,
-    debug::{DebugAction, DebugPoint, DebugSession, DebugSnapshot},
+    debug::{DebugAction, DebugPoint, DebugSession, DebugSnapshot, STEER_CAPACITY},
     message::{AssistantMessage, Message, ToolOutput},
     model::{ModelError, ModelRequest},
     tools::{ToolDefinition, ToolRegistry},
@@ -107,9 +107,15 @@ impl<M: Model> Agent<M> {
             self.state,
             RunState::Running { .. } | RunState::Paused { .. }
         ) {
+            if let Some(debug) = &mut debug {
+                debug.reject_pending_steers(emit).await;
+            }
             return Err(AgentError::Interrupted);
         }
         if input.trim().is_empty() {
+            if let Some(debug) = &mut debug {
+                debug.reject_pending_steers(emit).await;
+            }
             return Err(AgentError::EmptyInput);
         }
         self.state = RunState::Running {
@@ -119,6 +125,11 @@ impl<M: Model> Agent<M> {
         emit(Event::RunStarted);
         self.commit(Message::User { text: input }, emit);
         let result = self.run_loop(cancel, &mut debug, emit).await;
+        if let Some(debug) = &mut debug {
+            // Close admission before draining: no successful enqueue can race
+            // past the terminal receipts into an already finished run.
+            debug.reject_pending_steers(emit).await;
+        }
         let outcome = match &result {
             Ok(outcome) => outcome.clone(),
             Err(_) => RunOutcome::Failed,
@@ -152,6 +163,35 @@ impl<M: Model> Agent<M> {
         )
         .await;
         for step in 1..=self.config.max_steps.get() {
+            if cancel.is_cancelled() {
+                return Ok(RunOutcome::Cancelled);
+            }
+            if let Some(debug) = debug {
+                // Only the next model boundary may append input. Every tool
+                // result from the previous batch is already committed here.
+                // Bound consumption even if an event callback refills the queue.
+                for _ in 0..STEER_CAPACITY {
+                    if cancel.is_cancelled() {
+                        return Ok(RunOutcome::Cancelled);
+                    }
+                    let Some(input) = debug.next_steer() else {
+                        break;
+                    };
+                    if cancel.is_cancelled() {
+                        emit(Event::SteerRejected {
+                            input_id: Some(input.input_id),
+                            reason: "Run ended before input was applied".into(),
+                        });
+                        return Ok(RunOutcome::Cancelled);
+                    }
+                    self.commit(Message::User { text: input.text }, emit);
+                    previous_batch = None;
+                    emit(Event::SteerApplied {
+                        input_id: input.input_id,
+                    });
+                    tokio::task::yield_now().await;
+                }
+            }
             if cancel.is_cancelled() {
                 return Ok(RunOutcome::Cancelled);
             }

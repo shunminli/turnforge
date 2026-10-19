@@ -101,6 +101,9 @@ struct RunArgs {
     /// Total timeout for each HTTP model request, including streaming (seconds).
     #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..=3600))]
     request_timeout: u64,
+    /// Maximum silence between complete SSE data events (seconds; opt-in).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    stream_idle_timeout: Option<u64>,
     /// Emit ordered NDJSON events to stdout (contains prompts/tool data).
     #[arg(long)]
     json: bool,
@@ -178,6 +181,7 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
                 http_retries: 0,
                 max_request_bytes: None,
                 request_timeout: 90,
+                stream_idle_timeout: None,
                 json: false,
             };
             (
@@ -244,6 +248,11 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
     .with_http_retries(args.http_retries)?;
     let model = if let Some(limit) = args.max_request_bytes {
         model.with_max_request_bytes(limit)
+    } else {
+        model
+    };
+    let model = if let Some(seconds) = args.stream_idle_timeout {
+        model.with_stream_idle_timeout(Duration::from_secs(seconds))?
     } else {
         model
     };
@@ -388,18 +397,29 @@ async fn execute(cli: Cli) -> Result<u8, Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(Some(command)) => {
-                    let text = match command {
-                        debug_input::ControlCommand::Help => output::LAB_HELP.into(),
-                        debug_input::ControlCommand::Learn => learning::catalog(lesson),
-                        debug_input::ControlCommand::NotPaused => {
-                            "[lab] 输入时尚未暂停，请等暂停提示后再操作；p 暂停，q 取消。\n".into()
+                    let item = match command {
+                        debug_input::ControlCommand::Steer { text } => {
+                            let receipt = match controller.try_steer(text) {
+                                Ok(input_id) => Event::SteerQueued { input_id },
+                                Err(error) => Event::SteerRejected {
+                                    input_id: None,
+                                    reason: error.to_string(),
+                                },
+                            };
+                            output::OutputItem::Event(receipt)
                         }
+                        debug_input::ControlCommand::Help => {
+                            output::OutputItem::Notice(output::LAB_HELP.into())
+                        }
+                        debug_input::ControlCommand::Learn => {
+                            output::OutputItem::Notice(learning::catalog(lesson))
+                        }
+                        debug_input::ControlCommand::NotPaused => output::OutputItem::Notice(
+                            "[lab] 输入时尚未暂停，请等暂停提示后再操作；p 暂停，q 取消。\n".into(),
+                        ),
                         debug_input::ControlCommand::Debug(_) => unreachable!(),
                     };
-                    if control_sender
-                        .try_send(output::OutputItem::Notice(text))
-                        .is_err()
-                    {
+                    if control_sender.try_send(item).is_err() {
                         controller.cancel();
                         return Err(io::Error::other(
                             "output queue full or closed; run cancelled",
@@ -456,6 +476,7 @@ mod tests {
             assert_eq!(args.http_retries, 0);
             assert_eq!(args.tool_repeat_limit, None);
             assert_eq!(args.max_request_bytes, None);
+            assert_eq!(args.stream_idle_timeout, None);
 
             let cli = Cli::try_parse_from([
                 "turnforge",
@@ -469,6 +490,8 @@ mod tests {
                 "2",
                 "--max-request-bytes",
                 "1024",
+                "--stream-idle-timeout",
+                "15",
             ])
             .unwrap();
             let (Command::Run(args) | Command::Debug(args)) = cli.command else {
@@ -477,6 +500,7 @@ mod tests {
             assert_eq!(args.http_retries, 3);
             assert_eq!(args.tool_repeat_limit, Some(2));
             assert_eq!(args.max_request_bytes.unwrap().get(), 1024);
+            assert_eq!(args.stream_idle_timeout, Some(15));
         }
     }
 
@@ -488,6 +512,8 @@ mod tests {
             ("--tool-repeat-limit", "0"),
             ("--tool-repeat-limit", "1"),
             ("--max-request-bytes", "0"),
+            ("--stream-idle-timeout", "0"),
+            ("--stream-idle-timeout", "3601"),
         ] {
             assert!(
                 Cli::try_parse_from([
@@ -503,5 +529,6 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(["turnforge", "lab", "--max-request-bytes", "1024"]).is_err());
+        assert!(Cli::try_parse_from(["turnforge", "lab", "--stream-idle-timeout", "15"]).is_err());
     }
 }

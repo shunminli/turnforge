@@ -87,7 +87,7 @@ fn encode(item: OutputItem, mode: &DisplayMode) -> io::Result<Vec<u8>> {
             Event::DebugPaused { snapshot } => {
                 let id = snapshot.pause_id;
                 format!(
-                        "\n[debug paused #{id}]\n{}\nCommands: step {id} | continue {id} | inspect {id} | pause | cancel\n",
+                        "\n[debug paused #{id}]\n{}\nCommands: step {id} | continue {id} | inspect {id} | steer TEXT | pause | cancel\n",
                         serde_json::to_string_pretty(&snapshot).map_err(io::Error::other)?
                     )
                     .into_bytes()
@@ -95,7 +95,7 @@ fn encode(item: OutputItem, mode: &DisplayMode) -> io::Result<Vec<u8>> {
             Event::DebugSnapshot { snapshot } => {
                 let id = snapshot.pause_id;
                 format!(
-                        "\n[debug snapshot #{id}]\n{}\nCommands: step {id} | continue {id} | inspect {id} | pause | cancel\n",
+                        "\n[debug snapshot #{id}]\n{}\nCommands: step {id} | continue {id} | inspect {id} | steer TEXT | pause | cancel\n",
                         serde_json::to_string_pretty(&snapshot).map_err(io::Error::other)?
                     )
                     .into_bytes()
@@ -107,6 +107,17 @@ fn encode(item: OutputItem, mode: &DisplayMode) -> io::Result<Vec<u8>> {
                 "\n[debug rejected] {}: {reason}\n",
                 serde_json::to_string(&command).map_err(io::Error::other)?
             )
+            .into_bytes(),
+            Event::SteerQueued { input_id } => {
+                format!("\n[steer queued #{input_id}]\n").into_bytes()
+            }
+            Event::SteerApplied { input_id } => {
+                format!("\n[steer applied #{input_id}]\n").into_bytes()
+            }
+            Event::SteerRejected { input_id, reason } => match input_id {
+                Some(id) => format!("\n[steer rejected #{id}] {reason}\n"),
+                None => format!("\n[steer rejected] {reason}\n"),
+            }
             .into_bytes(),
             _ => Vec::new(),
         },

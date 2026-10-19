@@ -99,6 +99,16 @@ cargo run --locked -- run '分析项目' --max-steps 10 --request-timeout 120 --
 `--max-steps` 计模型步骤，不是工具调用数或 HTTP 尝试数；`--request-timeout` 覆盖每次 HTTP 尝试及流读取，
 `--tool-timeout` 只配置 shell。完整范围和默认值仍由 [CLI 配置合同](modules/cli/design.md#公共入口)维护。
 
+服务已经开始响应却长时间不产生完整 SSE data event 时，可为 run/debug 增加流空闲限制：
+
+```sh
+cargo run --locked -- run '分析项目' --request-timeout 120 --stream-idle-timeout 15
+```
+
+它从成功响应 headers 后计时，完整 data event 到来才续期；注释心跳和未闭合碎片不会续期。
+请求总超时仍独立生效，空闲超时或流错误不会触发 HTTP 重试。它不计人工暂停或工具执行时间；
+精确合同见[模型设计](modules/model/design.md)，Lab 使用固定配置。
+
 两项可选可靠性策略默认关闭；`run` 与 `debug` 共用，Lab 固定关闭：
 
 ```sh

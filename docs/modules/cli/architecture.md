@@ -14,7 +14,8 @@ CLI 是 headless 库的第一个真实消费者，每个 `run`、`debug` 或 `la
 Lab 的基线/临时场景/oracle 属于[Lab 模块](../harness-lab/architecture.md)，课程属于[学习模块](../learning/architecture.md)。
 CLI 只把它们组合到原有调度和输出生命周期；`learn` 不创建模型或 Agent。
 可选重复工具阈值移入 AgentConfig，由 Agent 决策；HTTP 重试与请求 body 字节上限移入 OpenAiModel，
-由单次模型调用 future 执行。宿主不持有检测历史、不额外 spawn worker，Lab 三项固定关闭。
+流空闲限制也由单次模型调用 future 执行。宿主不持有检测历史或 SSE 时钟，不额外 spawn worker；
+Lab 固定关闭这些可选策略。
 
 ## 组件关系
 
@@ -58,8 +59,13 @@ run、writer 与 control 是 `tokio::join!` 并发轮询的 future，不是各�
 
 input 在 writer 初始化 stdout 前创建，并活到 writer 结束后：stdin/stdout 可能共享同一个终端
 open-file description，恢复非阻塞 flags 的顺序必须与设置相反。与输出一样，强杀和恢复失败不是事务保证。
-run 结束设置 `run_done`，control 停止等待下一行；EOF、语法/读取错误或队列错误取消 run 并等待清理。
+run 结束设置 `run_done`，control 停止等待下一行；EOF、语法/读取错误或调试控制队列错误取消 run 并等待清理。
 调试 Pause 是库安全点的操作，不通过让控制输入线程持有 Agent 锁来冻结运行。
+
+原生 debug 的 `steer` 由 control 调用 `DebugController::try_steer` 接纳，再把成功/失败回执作为 Event
+送入同一个 writer。它使用独立的有界输入队列，不占暂停命令的队列；Agent 仍是 transcript 唯一 writer，
+只在下一模型请求边界提交额外 User。宿主不打断当前模型或工具、不替换 run 的事件回调；
+接纳失败本身不取消运行，输出失败仍按原有宿主错误路径取消。固定任务 Lab 不开放这条输入路径。
 
 Lab 的快捷键由同一个 DebugInput 解析；一个 buffer 内的行绑定 read 时观察的 pause ID，跨 read 半行绑定首字节的 ID。
 不能等解析下一行时才换成新 pause ID。库仍验证命令 ID 与入队 epoch，宿主 observed_pause 只是 UI 观察投影。

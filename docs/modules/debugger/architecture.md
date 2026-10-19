@@ -7,6 +7,7 @@
 
 让宿主观察并控制**同一个正在运行的 Agent**：在模型请求前、完整助手消息提交后、每条工具结果提交后
 查看上下文，选择单步或连续执行。这里的“步”是模型/工具的语义动作，不是 Rust 源码行，也不是逐 token 暂停。
+同一控制会话还允许把新的用户指示放入独立有界队列，等下一模型边界由 Agent 追加。
 
 不实现任意编辑历史、撤销文件副作用、时光倒流、会话导入、断线恢复、持久化日志或交互式工具审批。
 不接管 provider 协议或工具生命周期；不包含 LLM Space 前端适配。调试开启不改变静态工具权限。
@@ -15,6 +16,7 @@
 
 ```text
 CLI stdin 控制输入 → DebugController → 有界命令 channel → DebugSession
+                           └────────→ 有界追加输入 channel ──┘
                                             cancel ───→ CancellationToken
                                                            ↓
                    Agent::run_debug（同一 run loop、transcript owner）
@@ -34,8 +36,9 @@ CLI 是当前实际控制端；未来 GUI/服务可消费相同逻辑合同，�
 | 状态 / 资源 | owner | 借用、转移与结束 |
 |---|---|---|
 | `messages`、`RunState`、模型和工具 | `Agent<M>` | `run_debug(&mut self, ...)` 独占借用；宿主不能并发改写 |
-| 命令 sender、取消 token | `DebugController` | 宿主持有；不实现 Clone；drop 请求取消，不代替 await run |
-| receiver、步进模式、pause 计数 | `DebugSession` | 每个 run 消费一次；不得复用于下一次 run |
+| 命令/追加输入 sender、取消 token | `DebugController` | 宿主持有；不实现 Clone；drop 请求取消，不代替 await run |
+| 两个 receiver、步进模式、pause 计数 | `DebugSession` | 每个 run 消费一次；不得复用于下一次 run；run 结束先关闭追加输入接纳 |
+| 上次分配的 input ID | Controller 的 `AtomicU64` | 只为单 session 的非阻塞接纳生成唯一 ID；溢出拒绝，不是跨进程去重状态 |
 | 当前暂停 epoch | Session 发布，Controller 只读共享的 `Arc<AtomicU64>` | 私有命令相关性元数据；入队时复制到 `QueuedCommand`，离开暂停由 `PauseEpoch` 清零 |
 | 当前暂停快照 | Agent checkpoint / DebugSession 的运行期数据 | owned 值经 Event 交给消费者；不向外泄漏会话可变引用 |
 | 模型请求 | 现有 Model future | 取消可 drop，完整响应才提交 |
@@ -62,11 +65,19 @@ CLI 是当前实际控制端；未来 GUI/服务可消费相同逻辑合同，�
 
 ## 控制面与观察面分离
 
-控制命令不修改消息，只改变下一次安全边界是否停下。带 `pause_id` 的命令必须匹配当前暂停；
+Step/Continue/Pause/Inspect 不修改消息，只改变执行或观察；追加输入则交给独立队列，不能通过快照反向编辑历史。
+带 `pause_id` 的命令必须匹配当前暂停；
 命令入队时还绑定 Session 当时发布的暂停 epoch；消费时同时检查 epoch 与命令 ID，
 已执行、运行中预送或延迟到达的旧命令不能释放新的暂停点。
 有限次排空命令只是公平调度，不是安全边界：发送者可能在排空期间补入更多命令。
 Cancel 使用与 run 共享的 token，独立于命令队列，不等待队列腾位。
+
+steer 接纳不占用单步命令的 8 个槽位，不释放暂停、不取消当前请求、不替换原 emit。
+每项最多 4096 UTF-8 字节，队列最多 8 项；ID 与输入 owned 值一起移入 receiver。
+Agent 只在下一模型请求前消费，整批工具必须先配对；每次最多消费 8 项，避免同步事件消费者持续补位饿死执行。
+Queued 是宿主接纳通知，Applied 是 Agent 提交 User 的通知，Rejected 表示未应用；都沿原有输出桥交付。
+ID 仅限当前 session，没有调用方自选 ID、持久化 journal、去重表或远端交付确认。
+这些 receipt 不含输入正文；真正提交的 User 和调试快照仍按原协议包含正文。
 
 观察事件属于原有 best-effort Event 流，不是调试协议的可靠存储。快照包含 system、完整已提交历史、
 可见工具和待执行调用，但没有模型凭据、provider 原始 HTTP 请求或持久化恢复信息。

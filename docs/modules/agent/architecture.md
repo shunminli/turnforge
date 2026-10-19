@@ -21,6 +21,7 @@
 | `state: RunState` | Agent 独占可变 | 可读取的阶段与结束结果 |
 | token / event callback | run 调用期间借用 | 宿主请求取消、消费通知 |
 | 可选 `DebugSession` | `run_debug` 消费，run 期间持有 | 有界控制接收端、单步模式与暂停序号；不持有 Agent |
+| 本 run 的追加输入 | DebugSession 持有独立有界 receiver，Agent 在模型前取走 owned 值 | 只有 Agent 提交 User；结束时关闭接纳并拒绝未应用项 |
 | 上一工具批次与连续重复次数 | `run_loop` 的私有局部值 | 开启重复保护时保存上批值；本 run 返回/drop 时释放，不跨 user turn 累积 |
 
 [CLI](../cli/architecture.md) 是实际宿主；未来其它宿主也应调用相同库 API。
@@ -56,6 +57,12 @@ Agent 设置 `Paused` 并通过事件发送 owned 快照；仍持有同一 `&mut
 没有工具执行或虚构的 AfterTool 暂停。
 工具结果后的边界意味着工具已返回且其清理 owner 完成正常清理路径，不是仅仅收到一个 stdout 标记。
 
+宿主可通过同一个 Controller 的独立 steer 队列追加用户输入。输入不会打断正在执行的模型或工具，
+也不会释放暂停。Agent 只在初始暂停释放后、后续整批工具结果闭合并释放暂停后，
+构造下一 ModelRequest 前有限消费；不在未配对的 Assistant/Tool 之间插入 User。
+每次真实追加后发 applied 回执，并清空上一工具批次的重复计数，保留原模型步数计数。
+只有自然发生的下一模型请求可以消费输入；最终回答、上限、错误和取消均不产生额外 followup。
+
 控制 channel、pause ID、防旧命令重放和快照字段属于[调试模块](../debugger/design.md)。
 Agent 仍负责所有调用结果配对；暂停处取消同样沿原工具补齐逻辑结束，不等待额外 Finish 命令。
 
@@ -78,6 +85,8 @@ Agent 仍负责所有调用结果配对；暂停处取消同样沿原工具补�
 意外 drop 或 callback panic 可使 run 停在 Running 或 Paused；后续调用明确拒绝恢复不确定状态。
 这不是完整的 crash recovery：已发生的外部副作用仍存在，历史也没有持久化。
 会话长期增长没有 token/内存总预算；max_steps 只限制本次 run 的模型请求次数。
+steer 队列只限制未应用输入为 8 项、每项 4096 UTF-8 字节，不是整个 run 的累计历史预算。
+applied 证明 User 已提交，不保证 HTTP 已发送；模型的请求字节准入仍可随后失败。
 `tool_repeat_limit` 默认关闭；启用时额外保留至多上一批 32 个调用的值副本。
 检测不把同一模型轮次中的多个相同调用计为多次重复，也不检测任意长的周期或工具成功/失败率。
 调试快照额外复制历史；这是观察成本，不是持久化或固定内存预算。

@@ -1155,13 +1155,240 @@ async fn debug_cli_request_byte_limit_ends_without_http_or_tool_actions() {
     );
     let paused = process.event("debug_paused").await;
     let id = paused["snapshot"]["pause_id"].as_u64().unwrap();
+    process
+        .send("steer keep this input even if HTTP is refused\n")
+        .await;
+    let input_id = process.event("steer_queued").await["input_id"]
+        .as_u64()
+        .unwrap();
     process.send(&format!("continue {id}\n")).await;
     let (observed, stderr) = process.finish(1, "failed").await;
+    assert!(
+        observed
+            .iter()
+            .any(|event| event["type"] == "steer_applied" && event["input_id"] == input_id)
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|event| event["message"]["text"] == "keep this input even if HTTP is refused")
+    );
     assert!(stderr.contains("model request body exceeds 1 bytes:"));
     assert!(!stderr.contains("fixture task"));
     assert!(!stderr.contains(&url));
     assert!(observed.iter().all(|event| event["message"]["role"] != "assistant" && event["type"] != "tool_started"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn debug_steering_preserves_the_active_stream_and_closes_tools_before_new_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (release, wait_for_input) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let accept = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        break socket;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "expected a model request");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        };
+        let mut first = accept();
+        let original_request = read_request(&mut first);
+        let prefix = event(json!({"content":"original stream begins "}), None);
+        let rest = format!(
+            "{}{}{}data: [DONE]\n\n",
+            event(json!({"content":"and continues"}), None),
+            event(
+                json!({"tool_calls":[
+                    {"index":0,"id":"write-before-steer","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"result.txt\",\"content\":\"written-before-steer\"}"}},
+                    {"index":1,"id":"read-before-steer","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"result.txt\"}"}}
+                ]}),
+                None
+            ),
+            event(json!({}), Some("tool_calls"))
+        );
+        first.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            prefix.len()+rest.len()
+        ).as_bytes()).unwrap();
+        first.write_all(prefix.as_bytes()).unwrap();
+        // The test releases the original response only after the real CLI has
+        // reported admission. Steering must leave this observer/request alive.
+        wait_for_input.recv_timeout(Duration::from_secs(3)).unwrap();
+        first.write_all(rest.as_bytes()).unwrap();
+        drop(first);
+        let mut second = accept();
+        let next_request = read_request(&mut second);
+        let messages = next_request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["system", "user", "assistant", "tool", "tool", "user"]
+        );
+        assert_eq!(messages[3]["tool_call_id"], "write-before-steer");
+        assert_eq!(messages[4]["tool_call_id"], "read-before-steer");
+        let read_result: Value =
+            serde_json::from_str(messages[4]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(read_result["data"]["text"], "written-before-steer");
+        assert_eq!(messages[5]["content"], "changed objective");
+        assert_eq!(original_request["tools"], next_request["tools"]);
+        let body = final_text("changed objective complete").body;
+        second.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        ).as_bytes()).unwrap();
+    });
+    let mut process = DebugProcess::start(dir.path(), &url, &["--allow-write"]);
+    let first = process.event("debug_paused").await;
+    process
+        .send(&format!("continue {}\n", first["snapshot"]["pause_id"]))
+        .await;
+    assert_eq!(
+        process.event("model_delta").await["delta"]["text"],
+        "original stream begins "
+    );
+    process.send("steer changed objective\n").await;
+    let id = process.event("steer_queued").await["input_id"]
+        .as_u64()
+        .unwrap();
+    assert!(!dir.path().join("result.txt").exists());
+    release.send(()).unwrap();
+    let (observed, stderr) = process.finish(0, "completed").await;
+    assert!(stderr.is_empty(), "{stderr}");
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("result.txt")).unwrap(),
+        b"written-before-steer"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|e| e["type"] == "run_started")
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|e| e["type"] == "step_started")
+            .count(),
+        2
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|e| e["type"] == "tool_started")
+            .count(),
+        2
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|e| e["type"] == "steer_applied" && e["input_id"] == id)
+            .count(),
+        1
+    );
+    assert!(!observed.iter().any(|e| e["type"] == "steer_rejected"));
+    let text: String = observed
+        .iter()
+        .filter(|e| e["type"] == "model_delta")
+        .filter_map(|e| e["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text,
+        "original stream begins and continueschanged objective complete"
+    );
+    let applied = observed
+        .iter()
+        .position(|e| e["type"] == "steer_applied")
+        .unwrap();
+    assert_eq!(observed[applied - 1]["message"]["role"], "user");
+    assert_eq!(
+        observed[applied - 1]["message"]["text"],
+        "changed objective"
+    );
+}
+
+#[tokio::test]
+async fn debug_steering_admission_failures_preserve_the_pause_and_cancel_rejects_pending_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let mut process = DebugProcess::start(dir.path(), &url, &[]);
+    let first = process.event("debug_paused").await;
+    process
+        .send("{\"command\":\"steer\",\"text\":\"   \"}\n")
+        .await;
+    assert!(process.event("steer_rejected").await["input_id"].is_null());
+    let mut ids = Vec::new();
+    for index in 0..8 {
+        process
+            .send(&format!(
+                "{{\"command\":\"steer\",\"text\":\"queued {index}\"}}\n"
+            ))
+            .await;
+        ids.push(
+            process.event("steer_queued").await["input_id"]
+                .as_u64()
+                .unwrap(),
+        );
+    }
+    process.send("steer ninth input\n").await;
+    let rejected = process.event("steer_rejected").await;
+    assert!(rejected["input_id"].is_null());
+    process
+        .send(&format!("inspect {}\n", first["snapshot"]["pause_id"]))
+        .await;
+    let snapshot = process.event("debug_snapshot").await;
+    assert_eq!(
+        snapshot["snapshot"]["pause_id"],
+        first["snapshot"]["pause_id"]
+    );
+    assert_eq!(
+        snapshot["snapshot"]["messages"].as_array().unwrap().len(),
+        1
+    );
+    process.send("cancel\n").await;
+    let (observed, _) = process.finish(130, "cancelled").await;
+    for id in ids {
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|e| e["type"] == "steer_rejected" && e["input_id"] == id)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        !observed
+            .iter()
+            .any(|e| e["type"] == "steer_applied" || e["type"] == "step_started")
+    );
     listener.set_nonblocking(true).unwrap();
     assert_eq!(
         listener.accept().unwrap_err().kind(),

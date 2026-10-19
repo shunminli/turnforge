@@ -21,6 +21,7 @@ Notice 直接写传入文本，当前只有 learn/Lab 文本路径生产它；�
 | 文本 / DebugSnapshot | Inspect 快照 ID、pretty JSON snapshot、命令提示 |
 | 文本 / DebugResumed | `[debug resumed #ID]` 通知 |
 | 文本 / DebugCommandRejected | 被拒绝命令的 JSON 和 reason，不输出用户无效输入原文 |
+| 文本 / SteerQueued、SteerApplied、SteerRejected | 对应 input ID 及拒绝 reason；接纳失败无 ID，不重复打印补充正文 |
 | 文本 / 其它事件 | 忽略，不调用 write |
 | Lab / StepStarted、ToolStarted、Tool committed | 模型进度、工具及参数预览、工具结果预览 |
 | Lab / DebugPaused | ID、point、next、消息/待调用计数；可选 learning::hint；快捷键或 auto 提示 |
@@ -31,6 +32,8 @@ Notice 直接写传入文本，当前只有 learn/Lab 文本路径生产它；�
 普通 run/debug 不追加额外成功信息或 stderr 进度；Lab 的额外验收 Notice 由宿主生成，不由 writer 自行判断。
 详细 Event 字段见 [协议设计](../protocol/design.md)。
 调试提示与快照属于 stdout 文本投影；`--json` 不混入这些提示，而是直接序列化对应 Event。
+CLI 的 steer 接纳回执也经同一 writer；不以 Notice 或单独 println 混入 NDJSON。
+协议中的 queued/applied/rejected 含义不因文本显示而改变，字段与提交顺序只由[协议设计](../protocol/design.md)维护。
 文本 delta 与 MessageCommitted 不重复显示，但每个模型步骤的 Text delta 都可能显示。
 JSON 不保证全行原子写入，尤其事件大于 pipe 缓冲时；断开/超时可能留下半行。
 Lab 的参数/工具结果 preview 先序列化完整 JSON，再取前 1200 个 Unicode char，超过时追加截断提示。
@@ -107,6 +110,9 @@ CLI 在 writer 返回错误时取消 run，等待 join，并让输出错误优�
 `actual_ctrl_c_cancels_shell_and_preserves_event_closure` 验证健康消费者下取消事件闭合，不代表故障端必达。
 `debug_cli_steps_real_tool_effects_and_finishes_with_stdin_open` 覆盖调试 NDJSON 事件与输入命令的交互，
 `debug_cli_sigint_during_shell_awaits_cleanup_and_closes_calls` 覆盖调试取消的健康输出端闭合。
+同文件 `debug_steering_preserves_the_active_stream_and_closes_tools_before_new_input` 和
+`debug_steering_admission_failures_preserve_the_pause_and_cancel_rejects_pending_inputs`
+检查 steer 成功/拒绝仍为纯 NDJSON，正文不以额外 println 混入输出。
 
 [lab_cli.rs](../../../tests/lab_cli.rs) 的 `lab_default_read_shortcuts_pause_inspect_and_finish_with_stdin_open`
 通过真实文本 stdout 检查暂停/Inspect/课程与最终报告；`learn_catalog_and_lessons_need_no_llm`

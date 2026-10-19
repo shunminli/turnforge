@@ -27,6 +27,7 @@ CLI 接收的 prompt 必须在参数里，`debug -` 不读取 prompt，因为 st
 不要让另一个程序同时读取这个 stdin。普通 `run -` 行为不变。
 本例临时目录由你的 shell 创建，原生 debug 不像 Lab 那样自动清理；退出后可检查文件，再自行清理该具体目录。
 `--request-timeout` 是逐请求限制，不包含人工暂停时间，也不是进程整体 deadline。
+需要检测流停滞时可使用[CLI 流空闲配置](cli.md#stdin输出与运行限制)中的 `--stream-idle-timeout`。
 
 ## 2. 跟着暂停点操作
 
@@ -39,6 +40,7 @@ CLI 接收的 prompt 必须在参数里，`debug -` 不读取 prompt，因为 st
 | `continue 1` | 从 pause 1 连续运行 |
 | `pause` | 连续运行中请求在下一个安全边界停下 |
 | `cancel` | 请求取消并等待清理 |
+| `steer 先保留已有结果，再检查遗漏项` | 补充当前任务的要求，等待下一模型请求边界应用；不需要 pause ID |
 
 数字 1 只是初始示例；每次 `step` 后都使用新输出的 ID。延迟到达的旧 ID 会被拒绝，不能让下一步意外运行。
 执行模型动作会看到完整响应；若模型提出多个工具调用，每个工具仍单独一步。
@@ -50,6 +52,18 @@ CLI 接收的 prompt 必须在参数里，`debug -` 不读取 prompt，因为 st
 自动化驱动应保持 stdin 打开到运行结束，不能简单把一条 `step` 管道输入后马上关闭。
 输入只支持终端、pipe/socket，`/dev/null` 立即取消；普通文件重定向会拒绝。
 每行最多 4 KiB，不含 LF；空行、非法 UTF-8/命令或超长行都会取消并作为宿主错误退出。
+
+### 补充当前任务的要求
+
+在原生 debug 的初始暂停或模型/工具运行中，可以输入上述 `steer ...`。观察 `steer queued` 后，
+如果当前暂停，仍须按当前 pause ID 输入 Step/Continue；steer 不推进或解除暂停。
+Agent 会先完成当前模型响应及其完整工具批次，再在下一模型请求前提交补充 User，显示 `steer applied`。
+它不打断正在进行的 HTTP 或工具动作，也不增加模型步骤预算。
+
+如果本轮自然给出最终答案、达到步数上限、失败或取消，尚未应用的输入会显示 rejected，
+不会自动变成新的任务。空白文本或输入队列已满等接纳失败也会显示 rejected，但不取消当前运行；
+错误命令语法仍按输入错误处理。Applied 只代表提交历史，后续请求仍可能被 body 大小限制拒绝。
+固定任务 Lab 不接受 steer；输入大小、队列和结束合同见[debugger 设计](modules/debugger/design.md)。
 
 ## 3. NDJSON 与自动化驱动
 
@@ -63,6 +77,12 @@ CLI 接收的 prompt 必须在参数里，`debug -` 不读取 prompt，因为 st
 {"command":"continue","pause_id":2}
 ```
 
+补充文本的 JSON 不带 `pause_id`：
+
+```json
+{"command":"steer","text":"先保留已有结果，再检查遗漏项"}
+```
+
 JSON 命令拒绝未知字段。自动化应做到：
 
 1. 启动 `turnforge debug ... --json`，持续读取 stdout/stderr，同时保留 stdin 的写端。
@@ -70,6 +90,11 @@ JSON 命令拒绝未知字段。自动化应做到：
 3. 校验当前现场，再发送带该 `pause_id` 的控制命令。
 4. Inspect 的应答是 `debug_snapshot`；它不产生新的 pause ID。处理 `debug_command_rejected`，不要当成成功。
 5. 收到 `run_finished` 后仍等待进程退出，检查退出码和真实文件结果；stdout 失败可能没有完整终态。
+
+发送 steer 后，按 `steer_queued.input_id` 关联 `steer_applied` 或带相同 ID 的 `steer_rejected`。
+接纳失败的 rejected 使用 `input_id: null`，不能当作一个已经入队的输入；所有回执仍是普通 NDJSON Event。
+库侧直接调用 `try_steer` 时用其返回 ID，库不另外产生 queued 事件。
+不要在连接中断或拒绝后自动重发并假定幂等；当前只提供单次运行内的 ID，没有持久恢复或撤销。
 
 原有 `step_started.step` 是模型请求次数，不是用户点击“下一步”的次数。
 `debug_paused` 表示 Agent 确实处于安全等待点；`model_delta` 只是暂态输出，不能作为已执行工具的证据。
@@ -86,6 +111,7 @@ JSON 命令拒绝未知字段。自动化应做到：
 - 快照包括完整 system、用户输入、模型文本、文件内容、工具参数和结果；可能敏感，不自动脱敏或上传。
 - 调试 channel 和 stdout 队列都有限额，但没有历史/快照总内存预算；长会话反复 Inspect 可能明显耗内存。
 - 无效 JSON、非法命令或输入读取故障会取消并以宿主错误退出 1；有效但 ID 过期的命令只产生拒绝事件，运行继续等待。
+- steer 的接纳、历史提交和模型实际收到是三个不同阶段；回执不表示外部 Codex 控制协议已接入。
 - stdout 不消费可能触发输出超时并取消；自动化必须持续排空，不等模型结束后才读取。
 - 暂停现场只存在于当前 run future；进程退出、future 被丢弃或强杀后不能恢复。
 - 暂停不是工具审批；读/写/shell 权限仍使用原有开关。没有条件断点、源码逐行调试或 rewind。

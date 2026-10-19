@@ -31,6 +31,7 @@ pub struct OpenAiModel {
     model: String,
     http_retries: u8,
     max_request_bytes: Option<NonZeroUsize>,
+    stream_idle_timeout: Option<Duration>,
 }
 
 impl OpenAiModel {
@@ -94,6 +95,19 @@ impl OpenAiModel {
         self
     }
 
+    /// Bound the wait for each complete SSE data event after successful HTTP
+    /// headers. Comments and partial frames do not reset this optional timer.
+    /// The existing request timeout remains independent; idle failures never retry.
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Result<Self, ModelError> {
+        if timeout.is_zero() || tokio::time::Instant::now().checked_add(timeout).is_none() {
+            return Err(config(
+                "stream idle timeout must be nonzero and representable",
+            ));
+        }
+        self.stream_idle_timeout = Some(timeout);
+        Ok(self)
+    }
+
     fn build(
         base_url: &str,
         api_key: Option<&str>,
@@ -147,6 +161,7 @@ impl OpenAiModel {
             model: model.into(),
             http_retries: 0,
             max_request_bytes: None,
+            stream_idle_timeout: None,
         })
     }
 
@@ -242,7 +257,19 @@ impl OpenAiModel {
         });
         let mut stream = bytes.eventsource();
         let mut assembly = Assembly::default();
-        while let Some(event) = stream.next().await {
+        let mut last_event = tokio::time::Instant::now();
+        loop {
+            let event = if let Some(timeout) = self.stream_idle_timeout {
+                let deadline = last_event
+                    .checked_add(timeout)
+                    .ok_or_else(|| config("stream idle timeout deadline cannot be represented"))?;
+                tokio::time::timeout_at(deadline, stream.next())
+                    .await
+                    .map_err(|_| ModelError::StreamIdleTimeout)?
+            } else {
+                stream.next().await
+            };
+            let Some(event) = event else { break };
             let event = event
                 .map_err(|_| protocol("SSE transport interrupted or response limit exceeded"))?;
             if event.data.trim() == "[DONE]" {
@@ -254,6 +281,7 @@ impl OpenAiModel {
             let chunk: Chunk =
                 serde_json::from_str(&event.data).map_err(|_| protocol("malformed JSON chunk"))?;
             assembly.push(chunk, emit)?;
+            last_event = tokio::time::Instant::now();
             // A buffered HTTP chunk may contain many SSE events. Yield so the
             // host can drain output and observe cancellation between events.
             tokio::task::yield_now().await;
