@@ -29,6 +29,8 @@ pub enum ModelError {
     Transport(String),
     #[error("model endpoint returned HTTP {0}")]
     HttpStatus(u16),
+    #[error("model request body exceeds {limit} bytes: {actual} bytes")]
+    RequestTooLarge { limit: usize, actual: usize },
     #[error("invalid model stream: {0}")]
     Protocol(String),
     #[error("invalid provider configuration: {0}")]

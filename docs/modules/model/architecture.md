@@ -13,6 +13,7 @@
 
 - 定义 `ModelRequest`、`ModelDelta`、`ModelError` 和 `Model::complete`。
 - 把内部消息和工具定义转换为 HTTP 请求，处理模型认证和请求超时。
+- 对宿主显式启用的完整请求字节上限做流前准入，不裁剪历史或工具证据。
 - 执行宿主显式启用的有限 HTTP 状态重试，保留同一请求体。
 - 解析流式响应、发出暂态增量、组装并校验完整 `AssistantMessage`。
 - 在请求结束、错误或取消时释放当前请求资源，不启动工具。
@@ -23,10 +24,10 @@
 ## 2. 依赖与调用链
 
 ```text
-CLI 宿主构造 OpenAiModel（endpoint / key / model / timeout / HTTP retries）
+CLI 宿主构造 OpenAiModel（endpoint / key / model / timeout / HTTP retries / request byte limit）
   → Agent<M> 持有 M
       → complete(ModelRequest 借用, cancel 借用, delta callback 借用)
-          → request: 内部消息 → Chat Completions JSON → reqwest / 有界状态重试
+          → request: 内部消息 → 完整 JSON 字节 → 可选字节准入 → reqwest / 有界状态重试
           → eventsource-stream → Assembly.push → ModelDelta → 宿主
           → [DONE] → Assembly.finish → AssistantMessage
       → Agent 再校验 → 提交消息 → 决定是否执行工具
@@ -47,11 +48,11 @@ Ollama 版本/digest 检查不属于通用 provider，仍由 Lab 预检负责。
 
 | 对象 | owner / 借用关系 | 生命周期与可变状态 |
 |---|---|---|
-| `OpenAiModel` | CLI 构造后 move 给 `Agent<M>` | 与 Agent 同寿命；持有 HTTP Client、endpoint、model ID 和不变的 retry limit |
+| `OpenAiModel` | CLI 构造后 move 给 `Agent<M>` | 与 Agent 同寿命；持有 HTTP Client、endpoint、model ID 和不变的 retry/字节限制 |
 | `ModelRequest<'a>` | 按值传入，字段只读借用 system/messages/tools | 只在一次调用期间使用，不保存会话引用 |
 | `CancellationToken` | 宿主持有，provider 借用 | 通知当前请求取消，不存进长期 provider |
 | `emit` | 调用方提供，provider 临时独占可变借用 | 同步回调，调用方必须保证不阻塞、不 panic |
-| 请求 JSON / Response / SSE stream / 重试计数与等待 | `request` future | JSON 在多个 HTTP attempt 间复用；每个 Response 独占；future 完成或 drop 时释放 |
+| 请求 JSON / 字节 body / Response / SSE stream / 重试计数与等待 | `request` future | JSON 只序列化一次后释放；准入的相同字节 body 在各 HTTP attempt 间复用；每个 Response 独占；future 完成或 drop 时释放 |
 | `Assembly` | `request` future 独占 | 文本、工具片段、usage 和 finish reason 的唯一写入者 |
 | `AssistantMessage` | `Assembly::finish` 返回 owned value | 交给 Agent；provider 不再持有或改写它 |
 
@@ -94,6 +95,8 @@ Agent 也在模型阶段竞争取消，故所有 `Model` 实现都必须允许 f
 - 共享客户端构造显式关闭 reqwest 内建重试，避免下游依赖特性合并启用 HTTP/2 后产生
   不归 `request` future 的状态重试循环计数的额外请求；本地与通用模型共用这一构造。
 - 不暴露任意 JSON 参数透传：新配置应先说明真实消费者和兼容性，再增加显式字段。
+- 可选请求上限检查实际 wire body 字节（含 system、历史、tool schema 和 JSON 转义）；
+  超限在任何 HTTP 前拒绝，不通过删消息或截断工具结果满足预算。这不是 token、费用或峰值内存上限。
 
 增加 Anthropic 或 Responses 适配器时，先确认现有 `AssistantMessage` 是否能表达其信息，
 不能把不可表示的信息悄悄丢掉后宣称兼容。模型名称并不自动选择协议。
@@ -104,7 +107,7 @@ provider 的请求转换可以变化，但不能越过 Agent 的消息提交边�
 
 ## 7. 维护入口
 
-先读 [Model contract](../../../src/model.rs)，再读 `OpenAiModel::new/new_local/with_http_retries/request` 和 `Assembly`。
+先读 [Model contract](../../../src/model.rs)，再读 `OpenAiModel::new/new_local/with_http_retries/with_max_request_bytes/request` 和 `Assembly`。
 主要跨边界证据是 [cli_http.rs](../../../tests/cli_http.rs)：真实 TCP → CLI → 文件 → 下一次请求。
 Agent 对模型失败和取消的处理由 [agent.rs 测试](../../../tests/agent.rs)补充。
 具体用例映射、尚未覆盖的协议分支与修改清单见[设计文档](design.md)。

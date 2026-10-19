@@ -24,6 +24,7 @@
 | max steps | `--max-steps` > 20 | `NonZeroU32`；模型步骤上限，不计同一步内 HTTP 重试 |
 | 重复工具防护 | `--tool-repeat-limit N`；缺省关闭 | 整数 2–4294967295；连续相同有序工具批次的阈值，忽略 call ID |
 | HTTP 重试 | `--http-retries N` > 0 | 整数 0–3；每模型步骤至多 1+N 次 HTTP 尝试，仅 429/502/503/504；无环境绑定 |
+| 请求 body 上限 | `--max-request-bytes N`；缺省关闭 | `NonZeroUsize` 正整数；每模型调用完整 UTF-8 JSON body，等于允许，超过在 HTTP 前失败；无环境绑定 |
 | 请求超时 | `--request-timeout` > 120 秒 | 整数 1–3600；每次 HTTP 尝试含流读取，不是全部尝试与退避的总 deadline |
 | 工具超时 | `--tool-timeout` > 30 秒 | 整数 1–3600；只配置 shell，含排空 |
 | 输出模式 | `--json`；缺省 false | NDJSON 或文本增量 |
@@ -45,7 +46,8 @@ debug 在建立 registry 前拒绝 prompt `-`；配置 provider/Agent 后建立 
 
 Lab 先 `lab::prepare` 完成本机预检和场景，再构造固定 RunArgs：max_steps 4、每模型请求 90 秒、
 临时 workspace、仅 write 场景文件写授权、始终无 shell、无 key，provider 使用 `OpenAiModel::new_local`。
-Lab 固定禁用重复批次防护和 HTTP 重试，不把随机失败重试到 PASS。
+Lab 固定禁用重复批次防护、HTTP 重试和请求 body 上限，不把随机失败重试到 PASS；
+Lab 不接受 `--max-request-bytes`，该参数只属于 run/debug。
 HostMode::Lab 持有 PreparedLab、automatic 和 lesson；自动模式不创建 DebugInput。
 `learn` 不创建 registry、provider 或 Agent，只把 catalog 放入容量 1 的 OutputItem channel，经 forward 写出并返回。
 模型预检与 learn 输出位于 run/signal 组合之前；不要将运行期 Ctrl-C 清理保证外推到这些前置路径。
@@ -143,6 +145,9 @@ stdout 故障时终态可能截断；下游必须同时检查进程退出码与�
 没有该批的 ToolStarted；AgentError 导致 Failed/退出 1。不是“任务无进展”的通用判定，也不撤销此前副作用。
 `--http-retries` 仅重放收到的指定非 2xx 状态，不重试 transport、成功响应的协议错误或流中断；
 100/200/400ms 退避可取消。隐含费用和提供方处理不可保证 exactly-once。详见 [Model 设计](../model/design.md)。
+`--max-request-bytes` 交给同一 Model request owner；超限产生 RequestTooLarge → Failed/退出 1，
+不发 HTTP、不提交当轮 Assistant、不执行该轮工具，也不改写此前已提交的历史或工具副作用。
+它只限制完整 wire body，不是 token/费用/内存预算，也不自动裁剪证据。
 
 主要证据：[tests/cli_http.rs](../../../tests/cli_http.rs) 的真实 TCP → CLI → 文件/进程链路。
 `fragmented_tool_arguments_round_trip_to_real_file_and_model` 覆盖模型参数、JSON 事件和工具结果回传。
@@ -150,11 +155,16 @@ stdout 故障时终态可能截断；下游必须同时检查进程退出码与�
 `cli_step_limit_has_distinct_exit_and_a_closed_tool_result` 覆盖退出 2 与工具结果闭合。
 `actual_ctrl_c_cancels_shell_and_preserves_event_closure` 覆盖真实 SIGINT、退出 130 与 shell 后代清理。
 `tools_and_help_work_without_a_model_or_key` 覆盖无需模型的入口；其它用例覆盖失败与输出堵塞。
+`cli_request_byte_limit_rejects_before_http_without_leaking_the_body` 与
+`later_request_byte_limit_preserves_completed_tools_and_closes_the_run` 覆盖发送前拒绝与此前真实写入的保留；
+binary 的 `reliability_options_are_opt_in_and_shared_by_run_and_debug`、
+`reliability_options_reject_invalid_budgets_before_execution` 覆盖共同默认、启用、零值拒绝及 Lab 参数排除。
 
 同文件的 `debug_cli_steps_real_tool_effects_and_finishes_with_stdin_open` 覆盖真实文件副作用时点、
 Inspect、旧 ID 拒绝、最终确认及开放 stdin 的正常退出；`debug_cli_eof_and_invalid_input_cancel_pending_tools`
 覆盖 EOF/非法输入取消和工具配对；`debug_cli_sigint_during_shell_awaits_cleanup_and_closes_calls`
 覆盖调试下真实进程清理；`debug_cli_rejects_stdin_prompt_and_regular_file_control_input` 覆盖输入通道前置拒绝。
+`debug_cli_request_byte_limit_ends_without_http_or_tool_actions` 覆盖 debug 的同一 body 准入及开放 stdin 下失败终止。
 `debug_input.rs` 的 `debug_json_commands_require_exact_fields` 覆盖 CLI 到命令类型的严格 JSON 解析，
 尤其 Pause/Cancel 多余字段不能被静默接受；调度协议验收另见[debugger 设计](../debugger/design.md#测试与变更检查)。
 

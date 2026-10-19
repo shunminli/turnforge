@@ -76,6 +76,10 @@ impl Server {
 }
 
 fn read_request(socket: &mut TcpStream) -> Value {
+    serde_json::from_slice(&read_request_body(socket)).unwrap()
+}
+
+fn read_request_body(socket: &mut TcpStream) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut buf = [0; 4096];
     let header_end = loop {
@@ -97,12 +101,17 @@ fn read_request(socket: &mut TcpStream) -> Value {
                 .then(|| value.trim().parse().unwrap())
         })
         .unwrap();
+    assert!(headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value.trim() == "application/json"
+        })
+    }));
     while bytes.len() < header_end + length {
         let count = socket.read(&mut buf).unwrap();
         assert!(count > 0);
         bytes.extend_from_slice(&buf[..count]);
     }
-    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+    bytes[header_end..header_end + length].to_vec()
 }
 
 fn response(body: String) -> Response {
@@ -322,6 +331,243 @@ fn http_error_body_is_not_leaked_or_retried() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("HTTP 429"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET-FROM-GATEWAY"));
     assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn request_byte_limit_measures_complete_utf8_body_and_retries_identical_bytes() {
+    use std::num::NonZeroUsize;
+    use turnforge::{
+        CancellationToken, Model,
+        message::{AssistantMessage, Message, ToolCall, ToolOutput},
+        model::{ModelError, ModelRequest},
+        openai::OpenAiModel,
+        tools::{Capability, ToolDefinition},
+    };
+
+    let system = "PRIVATE-PROMPT 你好\n\"quoted\"";
+    let messages = [
+        Message::User {
+            text: "任务".into(),
+        },
+        Message::Assistant {
+            message: AssistantMessage {
+                text: "已读取".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path":"a"}),
+                }],
+                usage: None,
+            },
+        },
+        Message::Tool {
+            call_id: "call-1".into(),
+            output: ToolOutput::ok(json!({"text":"证据"})),
+        },
+    ];
+    let tools = [ToolDefinition {
+        name: "read_file".into(),
+        description: "读取文件".into(),
+        parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        capability: Capability::Read,
+    }];
+    // Independent wire oracle: API inputs are mapped here explicitly, without
+    // calling the provider's request conversion or deriving expected from it.
+    let expected = serde_json::to_vec(&json!({
+        "model":"fixture", "stream":true, "stream_options":{"include_usage":true},
+        "messages":[
+            {"role":"system","content":system},
+            {"role":"user","content":"任务"},
+            {"role":"assistant","content":"已读取","tool_calls":[{
+                "id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}
+            }]},
+            {"role":"tool","tool_call_id":"call-1","content":"{\"status\":\"ok\",\"data\":{\"text\":\"证据\"}}"}
+        ],
+        "tools":[{"type":"function","function":{
+            "name":"read_file","description":"读取文件",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+        }}]
+    }))
+    .unwrap();
+
+    for limit in [None, Some(expected.len()), Some(expected.len() - 1)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let model = OpenAiModel::new_local(&url, "fixture", Duration::from_secs(3))
+            .unwrap()
+            .with_http_retries(1)
+            .unwrap();
+        let model = match limit {
+            Some(limit) => model.with_max_request_bytes(NonZeroUsize::new(limit).unwrap()),
+            None => model,
+        };
+        let rejected = limit.is_some_and(|limit| limit < expected.len());
+        let observer = if rejected {
+            None
+        } else {
+            let listener = listener.try_clone().unwrap();
+            Some(thread::spawn(move || {
+                let mut bodies = Vec::new();
+                for response in [
+                    Response {
+                        status: 503,
+                        body: String::new(),
+                    },
+                    final_text("complete"),
+                ] {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    bodies.push(read_request_body(&mut socket));
+                    write!(socket, "HTTP/1.1 {} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.status, response.body.len(), response.body).unwrap();
+                }
+                bodies
+            }))
+        };
+        let mut deltas = Vec::new();
+        let result = model
+            .complete(
+                ModelRequest {
+                    system,
+                    messages: &messages,
+                    tools: &tools,
+                },
+                &CancellationToken::new(),
+                &mut |delta| deltas.push(delta),
+            )
+            .await;
+        if let Some(observer) = observer {
+            assert_eq!(result.unwrap().text, "complete");
+            assert_eq!(
+                observer.join().unwrap(),
+                vec![expected.clone(), expected.clone()]
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ModelError::RequestTooLarge { limit, actual })
+                if limit == expected.len() - 1 && actual == expected.len())
+            );
+            assert!(deltas.is_empty());
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let model = OpenAiModel::new_local(&url, "fixture", Duration::from_secs(3))
+        .unwrap()
+        .with_max_request_bytes(NonZeroUsize::new(1).unwrap());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        model
+            .complete(
+                ModelRequest {
+                    system,
+                    messages: &messages,
+                    tools: &tools
+                },
+                &cancel,
+                &mut |_| panic!("cancelled request emitted a delta")
+            )
+            .await,
+        Err(ModelError::Cancelled)
+    ));
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn cli_request_byte_limit_rejects_before_http_without_leaking_the_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let output = command(dir.path(), &url)
+        .args([
+            "--max-request-bytes",
+            "1",
+            "--http-retries",
+            "3",
+            "--allow-write",
+        ])
+        .output()
+        .unwrap();
+    assert_outcome(&output, 1, "failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("model request body exceeds 1 bytes:"));
+    assert!(!stderr.contains("fixture task"));
+    assert!(!stderr.contains(&url));
+    let observed = events(&output);
+    assert!(observed.iter().all(|event| event["message"]["role"] != "assistant" && event["type"] != "tool_started"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn later_request_byte_limit_preserves_completed_tools_and_closes_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = "证据".repeat(2000);
+    let server = Server::start(vec![tool(
+        "write_file",
+        json!({"path":"evidence.txt","content":content}),
+    )]);
+    let output = command(dir.path(), &server.base_url)
+        .args([
+            "--max-request-bytes",
+            "8192",
+            "--http-retries",
+            "3",
+            "--allow-write",
+        ])
+        .output()
+        .unwrap();
+    assert_outcome(&output, 1, "failed");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("model request body exceeds 8192 bytes:")
+    );
+    assert_eq!(server.finish().len(), 1);
+    let observed = events(&output);
+    let results: Vec<_> = observed
+        .iter()
+        .filter(|event| event["message"]["role"] == "tool")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["message"]["call_id"], "call-1");
+    assert_eq!(results[0]["message"]["output"]["status"], "ok");
+    assert_eq!(
+        results[0]["message"]["output"]["data"]["bytes"],
+        content.len()
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event["message"]["role"] == "assistant")
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event["type"] == "step_started")
+            .count(),
+        2
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("evidence.txt")).unwrap(),
+        content
+    );
 }
 
 #[test]
@@ -895,6 +1141,32 @@ impl DebugProcess {
         assert_eq!(self.observed.last().unwrap()["outcome"], outcome);
         (self.observed, stderr)
     }
+}
+
+#[tokio::test]
+async fn debug_cli_request_byte_limit_ends_without_http_or_tool_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let mut process = DebugProcess::start(
+        dir.path(),
+        &url,
+        &["--max-request-bytes", "1", "--allow-write"],
+    );
+    let paused = process.event("debug_paused").await;
+    let id = paused["snapshot"]["pause_id"].as_u64().unwrap();
+    process.send(&format!("continue {id}\n")).await;
+    let (observed, stderr) = process.finish(1, "failed").await;
+    assert!(stderr.contains("model request body exceeds 1 bytes:"));
+    assert!(!stderr.contains("fixture task"));
+    assert!(!stderr.contains(&url));
+    assert!(observed.iter().all(|event| event["message"]["role"] != "assistant" && event["type"] != "tool_started"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[tokio::test]
