@@ -14,7 +14,7 @@ pub mod tools;
 pub use agent::{Agent, AgentConfig, AgentError};
 pub use debug::{
     DebugAction, DebugCommand, DebugControlError, DebugController, DebugPoint, DebugSession,
-    DebugSnapshot, debug_channel,
+    DebugSnapshot, SteerControlError, debug_channel,
 };
 pub use event::{Event, Phase, RunOutcome, RunState};
 pub use model::Model;

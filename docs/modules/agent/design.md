@@ -34,6 +34,21 @@ max_steps 默认 20，tool_repeat_limit 默认 None（关闭）；没有统一�
 7. 有调用时进入 Tools 阶段，逐条执行/跳过并提交结果；检查取消后决定是否进入下一轮。
 8. run_loop 返回后设置 Finished，并发一次 RunFinished；模型错误或重复保护触发时 state/event 为 Failed，但函数返回 Err。
 
+调试追加输入的唯一提交点位于每轮 ModelRequest 构造前：初始安全点已释放，或上一工具批次全部配对、
+最后安全点已释放。每次最多取 8 项；每项前后检查取消，提交 User 后发 SteerApplied，再让出调度。
+追加输入不增加或重置 max_steps，也不在模型/工具运行中修改被借用的历史或替换 emit。
+已提交输入的 Applied 不会因随后取消或模型准入失败撤回；尚未提交的项保持待拒绝状态。
+每个成功应用的输入重置上一工具批次重复计数，因为模型将面对新的用户指示。
+
+run_loop 返回后，设置 Finished 和发 RunFinished 前先关闭 steer receiver，并逐条发 SteerRejected，
+输入 ID 为 Some；先关闭保证回执 callback 无法再成功入队。没有额外模型调用或合成 User。
+关闭后使用 recv().await 直到 None，而不是 try_recv 遇 Empty 即结束；同步 try_send 也可能在另一线程
+已取得容量、尚未入队。收尾等待这些 in-flight send 完成，总待拒绝项仍不超过 8，没有后台 drain task。
+有限项数不表示全局退出 deadline；正常收尾仍需这些同步调用与宿主调度取得进展。
+run_debug 因空输入或 Interrupted 前置拒绝时也关闭并拒绝已入队输入，但仍不发 RunStarted/RunFinished。
+Controller 未提交成功的输入没有 core 回执；完整正常 await 的成功排队 ID 各有一次 Applied 或 Rejected。
+panic、丢弃 run future、强杀以及宿主输出交付故障仍不提供可靠收据保证。
+
 默认接受任何 Finished 后的下一次 run；同一个 Agent 保留上一次用户输入及已提交历史。
 模型错误不会撤销已有 User；没有“失败 run 自动回滚到之前”的逻辑。
 
@@ -66,6 +81,7 @@ max_steps 默认 20，tool_repeat_limit 默认 None（关闭）；没有统一�
 不同批次重新从 1 计数。调用 ID、Assistant 文本和 usage 不参与比较。
 参数按 `serde_json::Value` 判等，不按 JSON 字符串判等；同一批内多个相同调用不会各自增加计数。
 检测状态为 `run_loop` 独占的上一批值副本及计数，失败、取消或自然结束后下一 user turn 都从零开始。
+通过 steer 真正提交新 User 时同样从零开始；仅入队而尚未应用不重置。
 
 达到 `tool_repeat_limit` 的当前 Assistant 已通过校验并提交，但该批没有任何工具获得执行机会。
 沿原有逐调用循环提交 `ToolOutput::Error { code: "tool_loop", ... }`，不发 ToolStarted，每条结果仍 yield。
@@ -93,6 +109,9 @@ Step/Continue 释放这一 Finish 后，整批补齐结果再终止，不产生 
 | 助手不再调用工具 | Ok(Completed)，或取消已观察时 Cancelled | 完整 Assistant 已提交 |
 | 最后一步仍产生工具调用且未取消 | Ok(StepLimit) | 所有调用都有结果，无额外模型总结 |
 | 调试暂停处取消 | Ok(Cancelled) | 已提交结果保留，待执行调用补 cancelled；不再等待人工释放 |
+
+无工具回答、StepLimit、ToolLoop、模型失败或取消时，未应用 steer 被拒绝，不转成下一 user turn。
+RequestTooLarge 是模型失败：应用过的 User 留在历史，但不能把 Applied 解读为模型已读取输入。
 
 工具返回一个 code 为 `cancelled` 的输出，并不会单独让 Agent 结束；是否结束仍由 token 决定。
 同理，工具 timeout 不是 Agent 的总超时。`RunOutcome::Failed` 作为状态/事件使用，当前错误路径返回 Err，
@@ -134,7 +153,17 @@ Tool 调用不放在外层 cancel-select 中，避免丢弃执行 future 造成�
 | Finish 暂停、部分/全部保护结果提交后取消优先 | `cancellation_overrides_a_tripped_tool_repeat_guard_before_and_during_closure` |
 | 立即完成的 32 个工具结果与宿主公平性 | [CLI 测试](../../../tests/cli_http.rs) `a_full_batch_of_immediate_tool_errors_does_not_overflow_output` |
 
-尚无空输入、超过 32 个调用、所有 panic/drop 时点、超长会话的穷尽测试；重复保护不证明任务停滞或成功。
+[steering.rs](../../../tests/steering.rs) 通过公共 Controller/Agent API 验证追加输入的边界：
+`steer_waits_for_closed_tool_batch_and_preserves_observer_and_pauses` 检查原 observer、Inspect、工具配对和下一请求历史；
+`applied_steer_resets_repeat_streak_without_resetting_model_steps` 检查新指示重置防护而模型步骤继续；
+`terminal_paths_reject_pending_inputs_without_creating_followup_requests` 检查自然结束、上限、模型错误、预算错误和取消；
+`cancellation_after_one_commit_preserves_its_receipt_and_rejects_the_rest` 保护部分应用后的取消事实；
+`event_callback_refills_cannot_starve_the_model_or_lose_terminal_receipts` 保护有限消费和关闭接纳后的完整拒绝。
+`concurrent_admission_and_finish_preserve_every_successful_input_receipt` 在独立 OS 线程并发接纳与模型结束，
+核对成功入队 ID 与 Applied/Rejected 的精确多重集合，失败接纳不算接受；不控制 Tokio 私有发送窗口。
+这里的预算错误使用 Model 公共错误模拟 Agent 边界，不冒充真实 HTTP 的字节计量；后者仍见模型设计。
+
+尚无超过 32 个调用、所有 panic/drop 时点、超长会话的穷尽测试；重复保护不证明任务停滞或成功。
 也无持久化恢复或并行工具合同。
 修改时检查：step 计数定义、terminal 位置、所有调用配对、模型/工具不同的取消策略、
 event sink 是否还非阻塞、同步完成路径是否仍让出调度。新并发或恢复能力先补跨模块设计与真实失败用例。

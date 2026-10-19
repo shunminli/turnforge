@@ -17,6 +17,7 @@ const MAX_LINE_BYTES: usize = 4096;
 
 pub enum ControlCommand {
     Debug(DebugCommand),
+    Steer { text: String },
     Help,
     Learn,
     NotPaused,
@@ -121,7 +122,7 @@ impl DebugInput {
                 _ => ControlCommand::Debug(parse_debug(line)?),
             }
         } else {
-            ControlCommand::Debug(parse_debug(line)?)
+            parse_control(line)?
         };
         self.line.clear();
         self.line_pause = None;
@@ -134,6 +135,28 @@ impl DebugInput {
             _ => ControlCommand::NotPaused,
         }
     }
+}
+
+// Host input has one additional command; typed debugger commands keep their
+// existing schema and pause-epoch checks in the library.
+#[derive(serde::Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+enum SteerInput {
+    Steer { text: String },
+}
+
+fn parse_control(line: &str) -> io::Result<ControlCommand> {
+    if line.starts_with('{')
+        && let Ok(SteerInput::Steer { text }) = serde_json::from_str(line)
+    {
+        return Ok(ControlCommand::Steer { text });
+    } else {
+        let (command, text) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        if command == "steer" {
+            return Ok(ControlCommand::Steer { text: text.into() });
+        }
+    }
+    parse_debug(line).map(ControlCommand::Debug)
 }
 
 fn parse_debug(line: &str) -> io::Result<DebugCommand> {
@@ -215,6 +238,36 @@ impl Drop for Descriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steering_input_is_strict_and_separate_from_pause_commands() {
+        for line in [
+            "steer 保留完整工具结果 then summarize",
+            r#"{"command":"steer","text":"保留完整工具结果 then summarize"}"#,
+        ] {
+            let ControlCommand::Steer { text } = parse_control(line).unwrap() else {
+                panic!("expected steering input");
+            };
+            assert_eq!(text, "保留完整工具结果 then summarize");
+            // Lab uses the strict debugger parser and retains fixed tasks.
+            assert!(parse_debug(line).is_err());
+        }
+        for line in [
+            r#"{"command":"steer"}"#,
+            r#"{"command":"steer","text":false}"#,
+            r#"{"command":"steer","text":"task","pause_id":1}"#,
+        ] {
+            assert!(parse_control(line).is_err());
+        }
+        assert!(matches!(
+            parse_control("steer").unwrap(),
+            ControlCommand::Steer { text } if text.is_empty()
+        ));
+        assert!(matches!(
+            parse_control("step 3").unwrap(),
+            ControlCommand::Debug(DebugCommand::Step { pause_id: 3 })
+        ));
+    }
 
     #[test]
     fn debug_json_commands_require_exact_fields() {

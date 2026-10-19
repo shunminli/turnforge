@@ -11,6 +11,7 @@
 - `ToolCall` / `ToolOutput` 关联请求与执行事实，`Usage` 保存可选的提供方计数。
 - `Event` 表达运行中可观察的通知，`RunState` / `Phase` / `RunOutcome` 区分阶段与结束原因。
 - 调试事件携带暂停快照、恢复通知和命令拒绝；命令与快照类型的 owner 是[debugger](../debugger/architecture.md)。
+- Steer 回执区分宿主接纳、Agent 提交与未应用拒绝；回执 ID 只关联本次 run 的附加输入。
 
 这里不运行模型或工具、不修改会话、不负责输出队列、持久化、时钟或 ID 生成。
 纯数据结构没有后台任务、文件句柄或主动取消行为。类型能区分变体，不能单独证明消息序列合法。
@@ -24,6 +25,8 @@
 | `MessageCommitted` | Agent 先写历史，再发送克隆值 | 宿主观察或输出 | 已进入内存 transcript，不表示落盘 |
 | `RunFinished` | Agent 完成协作运行后产生 | 宿主决定显示/退出 | 运行结束通知，不是任务正确性的证明 |
 | `DebugPaused` / `DebugSnapshot` | Agent 安全边界复制逻辑上下文 | 调试宿主显示与检查 | 只读观察，不是恢复 checkpoint 或第二份可变会话 |
+| `SteerQueued` | CLI 接纳附加输入后产生 | 调试宿主观察 | 仅已入队，不是模型已收到 |
+| `SteerApplied` / `SteerRejected` | Agent 提交 User 后或结束时产生；接纳失败由 CLI 产生拒绝 | 调试宿主关联回执 | 当前运行内的输入结果，不是持久化或幂等记录 |
 
 `Event` 包装的 `ModelDelta` 定义位于 [model.rs](../../../src/model.rs)，由[模型模块](../model/architecture.md)
 负责其生成语义。逻辑上都属于跨边界数据，但不为文档分类移动 Rust 类型。
@@ -35,6 +38,7 @@
 模型 → delta → Event::ModelDelta → 宿主（可以先显示）
 模型 → 完整 AssistantMessage → Agent 校验/提交 → MessageCommitted
 工具 → ToolOutput → Agent 关联 call_id/提交 → MessageCommitted
+debug steer → Controller 输入队列 → Agent 下一模型边界 → User 提交 → SteerApplied
 ```
 
 [Agent](../agent/architecture.md) 是会话唯一写入者；消费者取得的 Event 值是克隆或独立数据。
@@ -56,6 +60,7 @@
 
 调试快照单独带 `version: 1` 和本会话 `pause_id`；这不为整个 Event 流补上远程 RPC 版本、
 全局 run ID、事件排序或恢复保证。带 ID 的 Step/Continue/Inspect 是控制请求，不是新的 Message 角色。
+Steer 的 `input_id` 也不升级为全局会话 ID；补充文本仍使用现有 `Message::User`，不增加消息角色。
 
 ## 维护边界
 

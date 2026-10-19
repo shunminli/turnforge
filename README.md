@@ -14,6 +14,7 @@ A lightweight agent harness in Rust, built for explicit state, reliable executio
 - OpenAI-compatible Chat Completions；文件读写、目录操作与 shell 工具。
 - 默认只读，文件写入和 shell 分别授权；超时、协作取消、输出限额和背压处理。
 - 可选的重复工具批次防护，以及仅在流开始前针对指定 HTTP 状态的有限重试。
+- 可选 SSE 完整事件空闲限制；原生 debug 可补充指令，并在下一模型请求前应用。
 - 原生语义单步调试、固定本地模型的 Harness Lab，以及联系源码的六阶段学习课程。
 - 不依赖真实模型的确定性测试，以及显式启用的本地 Ollama 回归。
 

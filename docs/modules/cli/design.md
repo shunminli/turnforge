@@ -26,6 +26,7 @@
 | HTTP 重试 | `--http-retries N` > 0 | 整数 0–3；每模型步骤至多 1+N 次 HTTP 尝试，仅 429/502/503/504；无环境绑定 |
 | 请求 body 上限 | `--max-request-bytes N`；缺省关闭 | `NonZeroUsize` 正整数；每模型调用完整 UTF-8 JSON body，等于允许，超过在 HTTP 前失败；无环境绑定 |
 | 请求超时 | `--request-timeout` > 120 秒 | 整数 1–3600；每次 HTTP 尝试含流读取，不是全部尝试与退避的总 deadline |
+| 流空闲超时 | `--stream-idle-timeout`；缺省关闭 | 整数秒 1–3600；成功 headers 后等待完整 SSE data event 的间隔；无环境绑定；精确计时归 Model |
 | 工具超时 | `--tool-timeout` > 30 秒 | 整数 1–3600；只配置 shell，含排空 |
 | 输出模式 | `--json`；缺省 false | NDJSON 或文本增量 |
 
@@ -46,8 +47,8 @@ debug 在建立 registry 前拒绝 prompt `-`；配置 provider/Agent 后建立 
 
 Lab 先 `lab::prepare` 完成本机预检和场景，再构造固定 RunArgs：max_steps 4、每模型请求 90 秒、
 临时 workspace、仅 write 场景文件写授权、始终无 shell、无 key，provider 使用 `OpenAiModel::new_local`。
-Lab 固定禁用重复批次防护、HTTP 重试和请求 body 上限，不把随机失败重试到 PASS；
-Lab 不接受 `--max-request-bytes`，该参数只属于 run/debug。
+Lab 固定禁用重复批次防护、HTTP 重试、请求 body 上限和流空闲限制，不把随机失败重试到 PASS；
+Lab 不接受 `--max-request-bytes` 或 `--stream-idle-timeout`，它们只属于 run/debug。
 HostMode::Lab 持有 PreparedLab、automatic 和 lesson；自动模式不创建 DebugInput。
 `learn` 不创建 registry、provider 或 Agent，只把 catalog 放入容量 1 的 OutputItem channel，经 forward 写出并返回。
 模型预检与 learn 输出位于 run/signal 组合之前；不要将运行期 Ctrl-C 清理保证外推到这些前置路径。
@@ -66,21 +67,31 @@ Descriptor Drop 尝试恢复原 flags；因 stdin/stdout 可能共享 open-file 
 解析时 trim 首尾空白，支持 CRLF；原始 debug 空行属于非法命令，Lab 空行代表下一步。
 EOF 前无 LF 的残行先尝试解析，之后读取 EOF 取消。
 支持 `step ID`、`continue ID`、`inspect ID`、`pause`、`cancel`；ID 为十进制 u64，缺失、符号或多余词拒绝。
-JSON 一行一个 `DebugCommand`，结构校验归[debugger 协议](../debugger/design.md)，未知字段拒绝。
+单步与观察命令的 JSON 一行一个 `DebugCommand`，结构校验归[debugger 协议](../debugger/design.md)，未知字段拒绝。
 诊断使用固定简短文本，不把无效输入原文回显到 stderr。
+
+原生 debug 另外由宿主 `ControlCommand::Steer` 接收 `steer TEXT`，或严格 JSON
+`{"command":"steer","text":"..."}`；不接受 `pause_id` 或其它字段。它不是 `DebugCommand` 的变体，
+不使用暂停 ID。文本有效性和独立输入队列由 `DebugController::try_steer` 校验，见
+[debugger 设计](../debugger/design.md)。上述 4096 字节单行上限包括命令前缀或 JSON 编码开销，
+不是另外提供 4096 字节 payload；非法 UTF-8、超长行或错误 JSON 仍是输入错误。
 
 control 用 biased select，优先观察 `run_done`，然后 cancel，再读下一命令。
 Step/Continue/Inspect/Pause 通过 `try_send`；Cancel 和 EOF 直接取消 token。
 语法/UTF-8/超长行/IO 错误或控制队列 full/closed 先取消，再等待 run/writer 清理，最终作为 input error 返回。
 已入队但 pause ID 失效是库级命令拒绝事件，不是输入语法失败；不会退出或自动释放另一暂停点。
+Steer 接纳成功由 CLI 立即排队 `SteerQueued`；空白文本、队列满/关闭等接纳失败排队
+`SteerRejected { input_id: None, reason }`，不取消运行。成功仅表示入队；User 提交与 Applied/终态拒绝
+由 Agent 决定。它不释放当前暂停；输入输出仍服从原有关闭、背压和错误优先级。
 run 完成时 `run_done.cancel()` 停止还开放的 stdin，避免等待用户再按回车才能退出。
 EOF 与完成竞速时不改写已经返回的 outcome；不能把“关闭 stdin”绝对等同于退出 130。
 
 ### Lab 快捷控制和课程
 
-`next_command(lab_pause: Option<&AtomicU64>)` 返回 `ControlCommand::{Debug,Help,Learn,NotPaused}`。
-None 保留原始严格 debug 解析；Lab 另外支持 Enter/n/next/step、c/continue、i/inspect、p、q、h/help/?、l/learn。
+`next_command(lab_pause: Option<&AtomicU64>)` 返回 `ControlCommand::{Debug,Steer,Help,Learn,NotPaused}`。
+None 使用原生 debug 的严格命令及独立 steer 解析；Lab 另外支持 Enter/n/next/step、c/continue、i/inspect、p、q、h/help/?、l/learn。
 完整 `step ID`/`continue ID`/`inspect ID`/`pause`/`cancel` 和 JSON 仍可走严格调试解析。
+Lab 的固定 prompt 不接受文本或 JSON steer；该输入按非法命令处理并取消，不能绕过场景 oracle。
 h/l 仅排队 Notice，不发 DebugCommand；未选课程的 l 返回总路线，已选返回该课。
 
 `observed_pause` 由事件 sink 从 DebugPaused 设置 ID、DebugResumed/RunFinished 清零。
@@ -97,12 +108,13 @@ h/l 仅排队 Notice，不发 DebugCommand；未选课程的 l 返回总路线�
 第一次失败保存 `output_error` 并设置 token；之后所有事件不再尝试入队，包括 RunFinished。
 Agent 仍被 await，以完成其内存状态和工具清理；run 完成设置 run_done。
 Lab 此时对 Completed 运行执行 PreparedLab::verify，随后排队 PASS/FAIL/CANCELLED Notice，再 drop 自己的 Sender。
-control 还持有一份用于 h/l 的 Sender；它被 run_done 停止并释放后，writer 才能收到 EOF 并排空。
+control 还持有一份用于接纳回执和 h/l 的 Sender；它被 run_done 停止并释放后，writer 才能收到 EOF 并排空。
 writer 对任何输出错误调用 token.cancel；receiver 随退出释放，使后续发送可能发现 closed。
 
 `--json` 把 Event 序列化成一行一个对象；文本模式写 Text delta，并在 RunFinished 写换行。
 调试文本模式另外显示暂停/Inspect 的完整 pretty JSON 快照和命令提示，显示恢复及命令拒绝通知；
-普通 run 不发这些事件，因此文本行为保持不变。
+也显示 steer 的 queued/applied/rejected 回执。全部回执仍经 OutputItem::Event 和同一个 writer；
+普通 run 不发这些控制事件，因此文本行为保持不变。
 所有 Text delta 都会显示，包含中间步骤的文本，不是只显示最后一条已提交 Assistant。
 stderr 的业务错误形如 `turnforge: {error}`；没有额外 JSON 错误对象或独立工具进度日志。
 Lab 使用独立文本投影：模型/工具/结果/暂停摘要，i 显示完整快照；课程、帮助和最终验收报告走相同有界 writer。
@@ -148,6 +160,9 @@ stdout 故障时终态可能截断；下游必须同时检查进程退出码与�
 `--max-request-bytes` 交给同一 Model request owner；超限产生 RequestTooLarge → Failed/退出 1，
 不发 HTTP、不提交当轮 Assistant、不执行该轮工具，也不改写此前已提交的历史或工具副作用。
 它只限制完整 wire body，不是 token/费用/内存预算，也不自动裁剪证据。
+SteerApplied 仅表示额外 User 已提交；随后同一个 body 准入仍可拒绝 HTTP，不能从 Applied 推导模型已收到。
+流空闲超时的计时、完整 data event 定义和不重试边界见[Model 设计](../model/design.md)；
+它与逐尝试请求总超时分别生效，不为模型暂停、工具执行或整个 run 建立 deadline。
 
 主要证据：[tests/cli_http.rs](../../../tests/cli_http.rs) 的真实 TCP → CLI → 文件/进程链路。
 `fragmented_tool_arguments_round_trip_to_real_file_and_model` 覆盖模型参数、JSON 事件和工具结果回传。
@@ -165,8 +180,13 @@ Inspect、旧 ID 拒绝、最终确认及开放 stdin 的正常退出；`debug_c
 覆盖 EOF/非法输入取消和工具配对；`debug_cli_sigint_during_shell_awaits_cleanup_and_closes_calls`
 覆盖调试下真实进程清理；`debug_cli_rejects_stdin_prompt_and_regular_file_control_input` 覆盖输入通道前置拒绝。
 `debug_cli_request_byte_limit_ends_without_http_or_tool_actions` 覆盖 debug 的同一 body 准入及开放 stdin 下失败终止。
+该用例也检查额外 User 已 Applied 后仍因 body 上限在 HTTP 前拒绝，回执不能当作远端收到的证明。
+`debug_steering_preserves_the_active_stream_and_closes_tools_before_new_input` 覆盖持续流、实际写/读及后续请求历史；
+`debug_steering_admission_failures_preserve_the_pause_and_cancel_rejects_pending_inputs` 覆盖纯 NDJSON 的失败回执、
+暂停不推进和取消后拒绝余项。
 `debug_input.rs` 的 `debug_json_commands_require_exact_fields` 覆盖 CLI 到命令类型的严格 JSON 解析，
 尤其 Pause/Cancel 多余字段不能被静默接受；调度协议验收另见[debugger 设计](../debugger/design.md#测试与变更检查)。
+同模块的 `steering_input_is_strict_and_separate_from_pause_commands` 检查独立 steer 文本/JSON schema 及 Lab 拒绝。
 
 [tests/lab_cli.rs](../../../tests/lab_cli.rs) 的
 `lab_default_read_shortcuts_pause_inspect_and_finish_with_stdin_open` 覆盖 Lab 真实文本交互、课程显示不推进及开放 stdin 结束，

@@ -10,6 +10,7 @@
 |---|---|
 | `debug_channel(&CancellationToken)` | 建立一个控制会话，返回 `(DebugController, DebugSession)` |
 | `DebugController::try_send(DebugCommand)` | 非阻塞提交命令；返回 `Result<(), DebugControlError>`；入队不等于 Agent 已接受 |
+| `DebugController::try_steer(text)` | 非阻塞追加输入；返回 `Result<u64, SteerControlError>`；成功仅确认入队，ID 限本 session |
 | `DebugController::cancel()` | 直接请求 token 取消，不依赖命令队列 |
 | `Agent::run_debug(input, session, emit)` | 消费 session，独占借用 Agent，返回与普通 run 相同的结果类型 |
 
@@ -18,6 +19,29 @@ Controller 不可 Clone；Drop 请求取消。Session 只用于一次 run，没�
 因此 Controller Drop 也会取消该 token 的其它观察者；宿主应持有 controller 到 run/输出清理完成。
 普通 `Agent::run(input, token, emit)` 的签名、非调试事件和自动运行行为保持不变。
 两种入口使用同一个模型/工具循环，不能通过调试模式跳过 registry 权限或 Assistant 校验。
+
+## 追加用户输入与回执
+
+`try_steer(&self, text: impl Into<String>)` 接收 owned 字符串；空白输入报 Empty，超过 4096 UTF-8 字节报 TooLarge。
+保留有效输入原文，不 trim 存储；独立 channel 容量 8，满报 Full，结束报 Closed。
+Controller 的 AtomicU64 从未分配状态 0 开始，checked_add 生成单调非零 ID；耗尽报 IdExhausted，不回绕。
+校验、满队列、关闭或 ID 耗尽都不自动取消 run。ID 分配后入队失败可以跳号；调用方不能指定 ID 或重放该 ID。
+这是进程内单 session 的接纳身份，不是跨进程幂等键；没有恢复、持久化或重复投递去重协议。
+
+steer 不属于 DebugCommand，不绑定 pause_id/epoch，不消耗调试命令槽位，也不解除任何暂停。
+Agent 只在初始暂停释放后或完整工具批次闭合后的下一模型请求前消费，详见[Agent 设计](../agent/design.md)。
+模型/工具运行中只排队，不打断原操作，也不替换 emit；最终回答不因待输入而生成额外模型请求。
+
+Event 的字段和 snake_case 标签由[协议设计](../protocol/design.md#事件和状态)唯一维护。
+CLI 接纳后产生 Queued，库直接调用方使用返回 ID；Agent 提交 User 后产生 Applied，
+它不证明下一 HTTP 已发送或模型已处理。Rejected 区分宿主接纳失败与已入队但未应用的输入。
+
+三个 receipt 均不含输入正文；reason 是固定简短诊断而非稳定错误码。
+输入真正应用后，其 User 仍通过 MessageCommitted/快照原样可见，不提供全局脱敏。
+run 收尾先关闭输入 receiver、拒绝剩余项，再发 RunFinished；回执不延长模型步数，也不修改已提交事实。
+关闭后 recv().await 至 None，覆盖另一线程 try_send 已获容量但尚未写入队列的窗口；不以暂时 Empty 当作收尾完成。
+排空项数有界，不承诺全局退出 deadline；需要 in-flight 同步发送与宿主调度继续取得进展。
+正常完整 await 才保证成功入队 ID 有一次 Applied/Rejected；drop、panic、强杀和输出故障沿既有有限交付合同。
 
 ## 命令与拒绝
 
@@ -157,6 +181,13 @@ HTTP/shell 超时适用于已开始的操作；人工暂停本身没有自动超
 [Agent 测试](../../../tests/agent.rs) 的 `tool_repeat_guard_debug_finish_closes_the_batch_without_tool_actions`
 覆盖保护命中时完整 pending_calls、Finish(Failed) 预览及一次释放后闭合整批，没有伪工具动作；
 `cancellation_overrides_a_tripped_tool_repeat_guard_before_and_during_closure` 覆盖暂停、部分及全部结果提交后取消优先。
+
+[追加输入测试](../../../tests/steering.rs) 的
+`steer_admission_is_bounded_and_independent_of_debug_commands` 保护容量、UTF-8 字节界限、关闭和不自动取消；
+`steer_waits_for_closed_tool_batch_and_preserves_observer_and_pauses` 保护 Inspect 不受影响、输入不解除暂停、配对后再提交及原事件连续；
+`a_rejected_run_closes_already_admitted_inputs_without_starting_a_run` 保护前置拒绝的已排队回执。
+其余 Agent 输入时序、部分取消、终态及有限补位测试见 Agent 设计映射。
+ID 耗尽分支依据 checked_add 实现；没有为触达 u64 极值增加生产测试 hook。
 
 真实 binary/HTTP/文件与信号证据在 [tests/cli_http.rs](../../../tests/cli_http.rs)：
 

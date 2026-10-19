@@ -51,6 +51,9 @@ OpenAI adapter 把 `arguments` 和整个 `ToolOutput` 分别编码成外部 API 
 | `debug_snapshot` | `snapshot` | 已执行下一动作或新增暂停点；它是 Inspect 的只读响应 |
 | `debug_resumed` | `pause_id` | 下一模型/工具必然成功 |
 | `debug_command_rejected` | `command`、`reason` | 命令已推进运行；该通知恰好表示拒绝 |
+| `steer_queued` | `input_id: u64` | CLI 成功接纳，不等于提交历史或模型收到 |
+| `steer_applied` | `input_id: u64` | User 已提交；后续 HTTP 仍可能被预算拒绝或失败 |
+| `steer_rejected` | `input_id: Option<u64>`、`reason: String` | 输入已应用、应自动重试或应新建 followup |
 
 `ModelDelta` 的 `kind` 为 `text { text }` 或 `tool_arguments { index, fragment }`。
 index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，也没有独立的全局 call ID。
@@ -59,6 +62,13 @@ index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，�
 调试暂停为 `Paused { step, pause_id, point }`，序列化 status 为 `paused`。
 普通 `run` 不发上述 `debug_*` 事件；既有消费者若穷尽匹配 Rust enum，需要显式处理新增变体。
 快照 v1、DebugPoint/DebugAction 和严格命令序列化详见[调试设计](../debugger/design.md)。
+
+`SteerQueued` 仅由 CLI 在 `try_steer` 成功后产生；库调用者取得返回 ID，不会额外收到库生成的 queued 事件。
+`SteerApplied` 由 Agent 在对应 `MessageCommitted { message: User }` 之后产生。
+`SteerRejected.input_id` 为数字时关联已接纳但结束前未应用的输入；为 JSON `null` 时表示 CLI 接纳失败，
+没有可关联的已接纳 ID。文本不放进回执载荷，成功提交后会出现在 User 消息中。
+接纳 ID 为本次运行内非零、单调递增的 u64，允许跳号；不是调用方幂等键、事件序号或持久恢复身份。
+输入边界与队列合同归[debugger 设计](../debugger/design.md)，提交顺序归[Agent 设计](../agent/design.md)。
 
 ## 配对、提交和取消不变量
 
@@ -69,6 +79,8 @@ index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，�
    可选重复批次防护拦截的整批同样不发 ToolStarted，提交 `tool_loop` 错误后以 Failed 结束。
 5. run 的 future 被完整等待且 callback 不 panic 时，已接受的 run 发一个 RunFinished。
    丢弃 future、panic、输出故障或宿主强杀不受“消费者收到一次 terminal”的保证保护。
+6. Steer 只在下一模型请求之前提交，并先闭合上一轮完整工具批次；不插入 Assistant 与其工具结果之间。
+   无下一模型请求的最终回答、步数上限、错误或取消路径关闭接纳并拒绝余项，不自动开启新 turn。
 
 例如，启动前 token 已取消时，当前 Agent 仍提交用户输入，再结束为 Cancelled；不调用模型。
 模型失败时已显示的 delta 不会被“回滚显示”，但不会进入完整 Assistant 历史。
@@ -78,6 +90,7 @@ index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，�
 
 - 无 session/run/step ID 全局命名、事件序号、时间戳或 JSON 版本字段；宿主不得跨运行盲目合流后依赖顺序恢复。
 - 调试 snapshot 有独立 version，pause ID 只在一次 DebugSession 内有意义；不是完整 Event 的全局版本或 ID。
+- Steer 回执只覆盖本次运行；没有 caller-supplied ID、幂等存储、撤销或跨进程 reconciliation。
 - Message 不保存 system prompt、工具定义、权限、模型配置，因此仅它本身不足以精确重放运行。
 - Usage 可缺省；缺省不等于零，不能把 token 字段当预算执行器。
 - 工具错误 code 为 String，不是封闭 enum；消费者应保留未知 code 的处理路径。
@@ -90,6 +103,10 @@ index 是本次 provider 消息内的索引，碎片可能不是合法 JSON，�
 覆盖顺序、校验和取消配对。`provider_error_leaves_no_partial_assistant` 覆盖失败时不提交半条消息。
 [CLI 测试](../../../tests/cli_http.rs) 的 `fragmented_tool_arguments_round_trip_to_real_file_and_model`
 覆盖实际 JSON 事件和 provider 之间的字段翻译；`actual_ctrl_c_cancels_shell_and_preserves_event_closure` 覆盖协作终态。
+[steering.rs](../../../tests/steering.rs) 的
+`steer_waits_for_closed_tool_batch_and_preserves_observer_and_pauses` 检查先闭合 Tool、提交 User 再 Applied；
+`terminal_paths_reject_pending_inputs_without_creating_followup_requests` 检查终态拒绝及不产生额外模型请求。
+CLI 实际 queued/带 ID 与 null 拒绝形状见 [CLI 设计的证据](../cli/design.md#验证与缺口)。
 
 尚无所有公共类型的完整 serde golden/round-trip 或版本兼容测试，不能声称稳定 wire ABI。
 修改前后检查：角色/标签是否变化；ToolOutput 是否仍可编码；各消费者 match 是否完整；

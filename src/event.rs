@@ -68,6 +68,18 @@ pub enum Event {
         command: DebugCommand,
         reason: String,
     },
+    /// Host admission receipt; the core never emits this event itself.
+    SteerQueued {
+        input_id: u64,
+    },
+    /// The Agent committed the input as User, not necessarily sent HTTP.
+    SteerApplied {
+        input_id: u64,
+    },
+    SteerRejected {
+        input_id: Option<u64>,
+        reason: String,
+    },
     RunFinished {
         outcome: RunOutcome,
     },

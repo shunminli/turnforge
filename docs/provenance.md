@@ -55,6 +55,33 @@ output budget or peak-memory bound. No Brain/platform source, tests, assets or
 dependencies are vendored. The source LICENSE remains MIT with the notice above;
 future concrete imports still require their own license/notice checks.
 
+## OpenCoder observer-preserving input and stream liveness ideas (2026-10-19)
+
+Reference inspected: [MoSunDay/opencoder](https://github.com/MoSunDay/opencoder),
+commit `ed6214dc192b5abaad8ef154847b92ed4de032ae`; synchronized fork merge
+`adb6daffd95d81d60f8f3e73497a0f5dd33cc287`, identical tree
+`66b30a2b962c2e4fc50b6b92bf4d0c8c191c730d`. The external-control capability is
+introduced by `9a8213e3dba80353fefcf7d20aa57bf7461f27c8`; reference areas are
+`crates/session/src/harness/codex/turn.rs`, its `control/` module, and
+`docs/external-harness-control.md`.
+
+Turnforge independently applies two narrower ideas to its existing consumers:
+an opt-in deadline between complete SSE data events in `OpenAiModel`, and
+additional debug input committed by the Agent before its next model request
+without interrupting current model/tool work or replacing its event observer.
+Upstream tracks silence in Codex JSONL output; Turnforge tracks complete SSE
+data events after successful HTTP headers, separately from its request timeout.
+Comments and partial frames do not refresh this deadline; idle failures are not
+retried.
+
+The input path uses a bounded, run-local queue and Agent-owned User commits.
+It does not import upstream's external startup-script protocol, durable request
+journal, stable caller identities, reconciliation or remote cancellation. No
+OpenCoder source, tests, assets or dependencies are vendored. The MIT notice and
+future concrete-import checks described above continue to apply; current scope
+and verification evidence are recorded in the
+[2026-10-19 adoption record](verification/opencoder-adoption-2026-10-19.md).
+
 Turnforge's repository license remains Apache-2.0. Cargo dependencies retain
 their own licenses. This note records source provenance, not a legal clearance
 of the entire dependency graph or future upstream imports.
